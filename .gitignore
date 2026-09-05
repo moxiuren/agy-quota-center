@@ -1,0 +1,26 @@
+# Target / Build artifacts
+target/
+build/
+dist/
+__pycache__/
+*.pyc
+*.spec
+
+# Credentials & Private Account Data (STRICT)
+accounts_backup/
+accounts/
+*.json
+!Cargo.lock
+
+# IDE & Editor
+.vscode/
+.idea/
+*.swp
+*.log
+
+# Windows specific
+Thumbs.db
+Desktop.ini
+*.exe
+*.o
+*.obj

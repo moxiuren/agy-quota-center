@@ -1,0 +1,21 @@
+[package]
+name = "agy-quota-center"
+version = "2.0.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = "0.4"
+dirs = "5.0"
+regex = "1.10"
+uuid = { version = "1.10", features = ["v4", "fast-rng"] }
+unicode-width = "0.1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
