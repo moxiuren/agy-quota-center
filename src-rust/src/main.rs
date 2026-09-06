@@ -1709,13 +1709,15 @@ fn stop_guard_daemon() -> bool {
     }
 }
 
+
 fn log_guard_event(msg: &str, silent: bool) {
     let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    let line = format!("[{}] {}\n", now, msg);
     if !silent {
-        print!("{}", line);
+        println!("[{}] {}", now, msg);
         let _ = io::stdout().flush();
     }
+    let clean_msg = strip_ansi(msg);
+    let line = format!("[{}] {}\n", now, clean_msg);
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(get_guard_log_path()) {
         let _ = f.write_all(line.as_bytes());
     }
@@ -1751,18 +1753,25 @@ fn run_guard_daemon(silent: bool) {
     log_guard_event(&format!("[启动] Antigravity 智能配额守护服务已启动 (PID: {})", my_pid), silent);
 
     if !silent {
-        println!("{}[*] 守护服务持续监听活动 agy 终端会话与配额状态...", C_CYAN);
-        println!("  - 当无 agy 运行：休眠待机 (零 API 开销)");
-        println!("  - 当有 agy 运行：每 35 秒轮询检测当前账号 5h / 周配额");
-        println!("  - 触发阈值：当前账号 5h <= 5% 或遭遇 429 频控");
-        println!("  - 触发动作：智能评分切换最优账号 + 自动热重载终端会话 + Windows Toast 桌面通知");
-        println!("  - 按 Ctrl+C 可安全退出守护监听\n{}", C_RESET);
+        println!("{}================================================================================{}", C_BOLD, C_RESET);
+        println!("{}  >>> Antigravity (AGY) 智能配额自动调配守护服务 (Live Monitor) <<<{}", C_BOLD, C_RESET);
+        println!("{}================================================================================{}", C_BOLD, C_RESET);
+        println!("  {}*{} 运行模式: 实时轮询 (每 20 秒自适应巡检与额度大盘同步)", C_CYAN, C_RESET);
+        println!("  {}*{} 切号阈值: 当前账号 5h 余量 ≤ 15%、周余量 ≤ 10% 或遭遇 API 429 频控", C_CYAN, C_RESET);
+        println!("  {}*{} 自动动作: 智能评分秒切最优账号 + 自动热重载终端会话 + Windows Toast 通知", C_CYAN, C_RESET);
+        println!("  {}*{} 日志文件: {}", C_CYAN, C_RESET, get_guard_log_path().display());
+        println!("  {}*{} 操作提示: 按 {}Ctrl+C{} 可安全退出前台监听 (不影响现有会话与凭据)", C_CYAN, C_RESET, C_YELLOW, C_RESET);
+        println!("{}================================================================================{}\n", C_BOLD, C_RESET);
     }
 
     let mut last_switch_time: Option<Instant> = None;
-    let switch_cooldown = Duration::from_secs(90);
+    let switch_cooldown = Duration::from_secs(60);
+    let mut check_count: u64 = 0;
+    let mut cached_candidates: Vec<(String, f64)> = Vec::new();
 
     loop {
+        check_count += 1;
+
         if let Some(cur_pid) = read_guard_pid() {
             if cur_pid != my_pid {
                 log_guard_event("[退出] 检测到新的守护实例启动或 PID 发生变更，当前守护正常退出", silent);
@@ -1774,17 +1783,7 @@ fn run_guard_daemon(silent: bool) {
         }
 
         let procs = get_all_agy_processes();
-        if procs.is_empty() {
-            std::thread::sleep(Duration::from_secs(60));
-            continue;
-        }
-
-        if let Some(last_time) = last_switch_time {
-            if last_time.elapsed() < switch_cooldown {
-                std::thread::sleep(Duration::from_secs(15));
-                continue;
-            }
-        }
+        let agy_cnt = procs.len();
 
         let (active_email, _) = get_current_active_info();
         let idx = load_account_index();
@@ -1798,75 +1797,192 @@ fn run_guard_daemon(silent: bool) {
             idx.accounts.iter().find(|a| a.email.eq_ignore_ascii_case(&active_email))
         });
 
-        let mut need_switch = false;
-        let mut trigger_reason = String::new();
+        let current_acc_id = current_acc_opt.map(|a| a.id.clone()).unwrap_or_default();
+        let mut cur_quota_opt: Option<ParsedQuota> = None;
+        let mut fetch_err_opt: Option<String> = None;
+        let mut cur_email = active_email.clone();
 
         if let Some(acc_meta) = current_acc_opt {
+            cur_email = acc_meta.email.clone();
             if let Some(mut acc) = load_account(&acc_meta.id) {
                 match ensure_valid_token(&mut acc) {
                     Ok(tok) => match fetch_quota_summary(&tok) {
                         Ok(sum) => {
-                            let q = parse_quota_buckets(&sum);
-                            let g5 = q.gemini_5h.unwrap_or(1.0);
-                            let c5 = q.claude_5h.unwrap_or(1.0);
-                            if g5 <= 0.05 || c5 <= 0.05 {
-                                need_switch = true;
-                                trigger_reason = format!(
-                                    "当前账号 [{}] 5h额度触底 (G: {:.0}%, C: {:.0}%)",
-                                    acc.email, g5 * 100.0, c5 * 100.0
-                                );
-                            }
+                            cur_quota_opt = Some(parse_quota_buckets(&sum));
                         }
                         Err(e) => {
-                            if e.contains("429") || e.contains("ResourceExhausted") || e.contains("RESOURCE_EXHAUSTED") {
-                                need_switch = true;
-                                trigger_reason = format!("当前账号 [{}] 遭遇 API 429 频控配额耗尽", acc.email);
-                            }
+                            fetch_err_opt = Some(e);
                         }
                     },
                     Err(e) => {
-                        log_guard_event(&format!("[警告] 刷新当前账号 Token 失败: {}", e), silent);
+                        fetch_err_opt = Some(format!("Token刷新失败: {}", e));
                     }
                 }
+            } else {
+                fetch_err_opt = Some("未找到账号配置实体".to_string());
+            }
+        } else {
+            fetch_err_opt = Some("账号池为空或未激活任何账号".to_string());
+        }
+
+        // 定期或在首轮同步备选账号池评分
+        if check_count == 1 || check_count % 10 == 0 || cached_candidates.is_empty() {
+            let (all_rows, _, _) = fetch_all_accounts_data();
+            let mut list: Vec<(String, f64)> = all_rows
+                .into_iter()
+                .filter(|r| r.acc.id != current_acc_id)
+                .map(|r| (r.acc.email.clone(), r.parsed.as_ref().map(|p| p.effective_score).unwrap_or(0.0)))
+                .collect();
+            list.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            cached_candidates = list;
+        }
+
+        let mut need_switch = false;
+        let mut trigger_reason = String::new();
+        let in_cooldown = last_switch_time.map(|t| t.elapsed() < switch_cooldown).unwrap_or(false);
+
+        let fmt_pct = |v: Option<f64>| -> String {
+            match v {
+                Some(f) => {
+                    let pct = f * 100.0;
+                    if pct >= 50.0 {
+                        format!("{}{:3.0}%{}", C_GREEN, pct, C_RESET)
+                    } else if pct >= 20.0 {
+                        format!("{}{:3.0}%{}", C_YELLOW, pct, C_RESET)
+                    } else {
+                        format!("{}{:3.0}%{}", C_RED, pct, C_RESET)
+                    }
+                }
+                None => format!("{} --{}", C_DIM, C_RESET),
+            }
+        };
+
+        if let Some(q) = &cur_quota_opt {
+            let g5 = q.gemini_5h.unwrap_or(1.0);
+            let c5 = q.claude_5h.unwrap_or(1.0);
+            let gw = q.gemini_weekly.unwrap_or(1.0);
+            let cw = q.claude_weekly.unwrap_or(1.0);
+
+            if g5 <= 0.15 || c5 <= 0.15 {
+                need_switch = true;
+                trigger_reason = format!(
+                    "5h额度告急 ≤ 15% (G-5h: {:.0}%, C-5h: {:.0}%)",
+                    g5 * 100.0, c5 * 100.0
+                );
+            } else if gw <= 0.10 || cw <= 0.10 {
+                need_switch = true;
+                trigger_reason = format!(
+                    "周额度告急 ≤ 10% (G-周: {:.0}%, C-周: {:.0}%)",
+                    gw * 100.0, cw * 100.0
+                );
+            } else if q.effective_score < 30.0 {
+                need_switch = true;
+                trigger_reason = format!(
+                    "综合调度得分过低 ({:.1} 分 < 30.0)，算力告竭",
+                    q.effective_score
+                );
+            }
+        } else if let Some(err) = &fetch_err_opt {
+            if err.contains("429") || err.contains("ResourceExhausted") || err.contains("RESOURCE_EXHAUSTED") {
+                need_switch = true;
+                trigger_reason = "当前账号遭遇 API 429 频控 / 配额完全耗尽".to_string();
+            } else if err.contains("403") {
+                need_switch = true;
+                trigger_reason = "当前账号权限受限 (403 Forbidden)".to_string();
             }
         }
 
-        if need_switch {
-            log_guard_event(&format!("[触发] 告警触发: {}", trigger_reason), silent);
+        let proc_desc = if agy_cnt > 0 {
+            format!("{}{} 个终端在线{}", C_GREEN, agy_cnt, C_RESET)
+        } else {
+            format!("{}0 个终端 (待机同步){}", C_DIM, C_RESET)
+        };
+
+        let quota_line = if let Some(q) = &cur_quota_opt {
+            let g_5h_cd = q.gemini_5h_countdown.as_deref().unwrap_or("--");
+            let g_w_cd = q.gemini_weekly_countdown.as_deref().unwrap_or("--");
+            let c_5h_cd = q.claude_5h_countdown.as_deref().unwrap_or("--");
+            let c_w_cd = q.claude_weekly_countdown.as_deref().unwrap_or("--");
+
+            format!(
+                "G(5h/周): {} / {} ({}/{}) | C(5h/周): {} / {} ({}/{})",
+                fmt_pct(q.gemini_5h), fmt_pct(q.gemini_weekly), g_5h_cd, g_w_cd,
+                fmt_pct(q.claude_5h), fmt_pct(q.claude_weekly), c_5h_cd, c_w_cd,
+            )
+        } else {
+            format!("{}配额异常: {}{}", C_RED, fetch_err_opt.as_deref().unwrap_or("未知"), C_RESET)
+        };
+
+        let status_desc = if in_cooldown {
+            let rem_s = switch_cooldown.as_secs().saturating_sub(last_switch_time.unwrap().elapsed().as_secs());
+            format!("{}[冷却防抖中 (剩余 {}s)]{}", C_YELLOW, rem_s, C_RESET)
+        } else if need_switch {
+            format!("{}[阈值告警触发: {} -> 立即切号！]{}", C_RED, trigger_reason, C_RESET)
+        } else if let Some(q) = &cur_quota_opt {
+            format!(
+                "{}[配额充沛 (综合评分: {:.1}) | 预计切号时机: 当 5h 余量 ≤ 15% 或遭遇 429 频控时自动秒切]{}",
+                C_GREEN, q.effective_score, C_RESET
+            )
+        } else {
+            format!("{}[异常待查]{}", C_YELLOW, C_RESET)
+        };
+
+        let candidate_line = if !cached_candidates.is_empty() {
+            let top_candidates: Vec<String> = cached_candidates
+                .iter()
+                .take(2)
+                .map(|(email, score)| format!("{} ({:.1}分)", email, score))
+                .collect();
+            top_candidates.join(" | ")
+        } else {
+            "暂无备选".to_string()
+        };
+
+        let log_text = format!(
+            "[巡检 #{}] 状态: {} | 活动账号: {}{}{}\n  -> 配额余量: {}\n  -> 调度评估: {}\n  -> 备选队列: {}",
+            check_count, proc_desc, C_BOLD, cur_email, C_RESET, quota_line, status_desc, candidate_line
+        );
+        log_guard_event(&log_text, silent);
+
+        if need_switch && !in_cooldown {
+            let warn_log = format!("{}[告警] 检测到当前账号达到切号阈值 ({})，正在检索最优候选目标...{}", C_YELLOW, trigger_reason, C_RESET);
+            log_guard_event(&warn_log, silent);
 
             let (_rows, _, best_acc) = fetch_all_accounts_data();
             if let Some(best) = best_acc {
-                log_guard_event(&format!("[调配] 正在执行智能切号，目标最优账号: {}", best.email), silent);
+                let plan_log = format!("{}[调配] 选定全局最高额度最优账号: {}{}{}，正在执行凭据覆写与会话恢复...{}", C_CYAN, C_MAGENTA, best.email, C_RESET, C_RESET);
+                log_guard_event(&plan_log, silent);
+
                 match switch_account_by_id(&best.id) {
                     Ok((switched_email, reloaded_cnt)) => {
-                        let ok_msg = format!(
-                            "[成功] 已自动切至最优账号: {} | 热重载恢复 {} 个 agy 终端会话",
-                            switched_email, reloaded_cnt
+                        let success_log = format!(
+                            "{}[成功] 智能切号完成！活动账号已平滑切至: {}{} | 已热重载恢复 {} 个 agy 终端会话{}",
+                            C_GREEN, switched_email, C_RESET, reloaded_cnt, C_RESET
                         );
-                        log_guard_event(&ok_msg, silent);
+                        log_guard_event(&success_log, silent);
                         send_desktop_notification(
                             "Antigravity 配额自动调配",
-                            &format!("当前额度耗尽，已自动切至最优账号: {}\n已恢复 {} 个终端会话", switched_email, reloaded_cnt),
+                            &format!("原账号额度告急，已自动切至最优账号: {}\n已恢复 {} 个终端会话", switched_email, reloaded_cnt),
                         );
                         last_switch_time = Some(Instant::now());
+                        cached_candidates.clear();
                     }
                     Err(e) => {
-                        let err_msg = format!("[错误] 智能切号失败: {}", e);
+                        let err_msg = format!("{}[错误] 自动切号失败: {}{}", C_RED, e, C_RESET);
                         log_guard_event(&err_msg, silent);
                     }
                 }
             } else {
-                let warn_msg = "[警告] 账号池中无其他更高额度可用账号，全部耗尽或受限";
-                log_guard_event(warn_msg, silent);
+                let exhausted_log = format!("{}[警告] 账号池中无其他更高额度的可用账号，全部耗尽或受限{}", C_YELLOW, C_RESET);
+                log_guard_event(&exhausted_log, silent);
                 send_desktop_notification(
                     "Antigravity 配额告警",
                     "账号池中所有账号配额均已耗尽，请等待最近窗口刷新！",
                 );
-                std::thread::sleep(Duration::from_secs(120));
             }
         }
 
-        std::thread::sleep(Duration::from_secs(35));
+        std::thread::sleep(Duration::from_secs(20));
     }
 
     remove_guard_pid();
@@ -1906,8 +2022,16 @@ fn option_guard_management() {
         match sel.trim() {
             "1" => {
                 if is_running {
-                    println!("\n{}[!] 守护服务已在后台运行中。如需前台运行，请先停止后台进程。{}", C_YELLOW, C_RESET);
-                    pause();
+                    print!("\n{}[!] 守护服务已在后台运行 (PID: {})。是否停止后台并转为前台实时监听？[Y/n]: {}", C_YELLOW, pid_opt.unwrap(), C_RESET);
+                    let _ = io::stdout().flush();
+                    let mut ans = String::new();
+                    let _ = io::stdin().read_line(&mut ans);
+                    if ans.trim().is_empty() || ans.trim().eq_ignore_ascii_case("y") {
+                        stop_guard_daemon();
+                        println!("\n[*] 正在启动前台守护监听 (按 Ctrl+C 可退出)...\n");
+                        run_guard_daemon(false);
+                        pause();
+                    }
                 } else {
                     println!("\n[*] 正在启动前台守护监听 (按 Ctrl+C 可退出)...\n");
                     run_guard_daemon(false);
