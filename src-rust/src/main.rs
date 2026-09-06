@@ -1756,7 +1756,7 @@ fn run_guard_daemon(silent: bool) {
         println!("{}================================================================================{}", C_BOLD, C_RESET);
         println!("{}  >>> Antigravity (AGY) 智能配额自动调配守护服务 (Live Monitor) <<<{}", C_BOLD, C_RESET);
         println!("{}================================================================================{}", C_BOLD, C_RESET);
-        println!("  {}*{} 运行模式: 智能动态自适应调频 (充沛区 120s / 待机 180s / 逼近阈值 25s)", C_CYAN, C_RESET);
+        println!("  {}*{} 运行模式: 极致能效动态调频 (超充沛 300s / 待机 300s / 平稳 150s / 警备 25s)", C_CYAN, C_RESET);
         println!("  {}*{} 切号阈值: 当前账号 5h 余量 ≤ 15%、周余量 ≤ 10% 或遭遇 API 429 频控", C_CYAN, C_RESET);
         println!("  {}*{} 自动动作: 智能评分秒切最优账号 + 自动热重载终端会话 + Windows Toast 通知", C_CYAN, C_RESET);
         println!("  {}*{} 日志文件: {}", C_CYAN, C_RESET, get_guard_log_path().display());
@@ -1878,13 +1878,15 @@ fn run_guard_daemon(silent: bool) {
             last_quota_metric = Some((Instant::now(), min_5h));
         }
 
-        // 自适应调频周期计算 (大幅精简无谓轮询)
+        // 自适应调频周期计算 (大幅精简无谓轮询，极致能效与省资源)
         let (next_poll_sec, tier_name) = if agy_cnt == 0 {
-            (180, "待机监控 (3分钟/次)")
-        } else if min_5h > 0.50 {
-            (120, "充沛安全区 (2分钟/次)")
-        } else if min_5h > 0.25 {
-            (60, "平稳消耗区 (60秒/次)")
+            (300, "待机休眠 (5分钟/次)")
+        } else if min_5h > 0.60 {
+            (300, "超充沛安全区 (5分钟/次)")
+        } else if min_5h > 0.35 {
+            (150, "充沛平稳区 (2.5分钟/次)")
+        } else if min_5h > 0.20 {
+            (60, "适度消耗区 (60秒/次)")
         } else {
             (25, "逼近阈值区 (25秒/次)")
         };
@@ -1963,9 +1965,14 @@ fn run_guard_daemon(silent: bool) {
                 C_GREEN, rate, time_desc, C_RESET
             )
         } else if let Some(q) = &cur_quota_opt {
-            if min_5h > 0.50 {
+            if min_5h > 0.60 {
                 format!(
-                    "{}[配额充沛 (综合评分: {:.1}) | 待机或低速中 | 预计切号: 2+小时以上 (当 5h 余量 ≤ 15% 时自动秒切)]{}",
+                    "{}[配额超充沛 (综合评分: {:.1}) | 待机或低速中 | 预计切号: 2+小时以上 (当 5h 余量 ≤ 15% 时自动秒切)]{}",
+                    C_GREEN, q.effective_score, C_RESET
+                )
+            } else if min_5h > 0.35 {
+                format!(
+                    "{}[配额充沛 (综合评分: {:.1}) | 平稳运行中 | 预计切号: 1+小时以上 (当 5h 余量 ≤ 15% 时自动秒切)]{}",
                     C_GREEN, q.effective_score, C_RESET
                 )
             } else {
