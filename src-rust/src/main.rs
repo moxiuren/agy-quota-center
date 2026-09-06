@@ -1108,27 +1108,37 @@ fn get_current_active_info() -> (String, String) {
     (email, tier)
 }
 
-fn switch_account_by_id(target_id: &str) -> Result<(String, usize), String> {
+fn switch_account_credentials_only(target_id: &str) -> Result<String, String> {
     let mut acc = load_account(target_id).ok_or("找不到指定账号详情")?;
     let access_tok = ensure_valid_token(&mut acc)?;
     let refresh_tok = acc.token.as_ref().and_then(|t| t.refresh_token.clone()).unwrap_or_default();
 
-    let mut cred_obj = read_keyring().unwrap_or(serde_json::json!({
+    let mut cred_obj = read_keyring().unwrap_or_else(|| serde_json::json!({
         "account_id": "",
         "token": {
             "access_token": "",
             "refresh_token": "",
             "expiry": "",
             "token_type": "Bearer"
-        }
+        },
+        "auth_method": "consumer"
     }));
 
     let now_dt = Utc::now().to_rfc3339();
     cred_obj["account_id"] = Value::String(acc.id.clone());
+    cred_obj["auth_method"] = Value::String("consumer".to_string());
     if let Some(t) = cred_obj.get_mut("token").and_then(|x| x.as_object_mut()) {
         t.insert("access_token".to_string(), Value::String(access_tok.clone()));
         t.insert("refresh_token".to_string(), Value::String(refresh_tok.clone()));
         t.insert("expiry".to_string(), Value::String(now_dt.clone()));
+        t.insert("token_type".to_string(), Value::String("Bearer".to_string()));
+    } else {
+        cred_obj["token"] = serde_json::json!({
+            "access_token": access_tok,
+            "refresh_token": refresh_tok,
+            "expiry": now_dt,
+            "token_type": "Bearer"
+        });
     }
 
     if !write_keyring(&cred_obj) {
@@ -1181,10 +1191,193 @@ fn switch_account_by_id(target_id: &str) -> Result<(String, usize), String> {
     acc.last_used = Some(now);
     save_account(&acc);
 
-    // 自动通知当前所有运行中的 agy 会话优雅退出并 resume 继续当前会话
-    let reloaded_count = reload_all_active_agy_sessions();
+    Ok(acc.email)
+}
 
-    Ok((acc.email, reloaded_count))
+fn switch_account_by_id(target_id: &str) -> Result<(String, usize), String> {
+    let email = switch_account_credentials_only(target_id)?;
+    let reloaded_count = reload_all_active_agy_sessions();
+    Ok((email, reloaded_count))
+}
+
+// -----------------------------------------------------------------------------
+// 周额度预热激活器 (Pre-warm Clock Kickstart)
+// -----------------------------------------------------------------------------
+fn prewarm_account_clock(target_id: &str, model: &str) -> Result<String, String> {
+    let idx = load_account_index();
+    let orig_id = idx.current_account_id.clone().unwrap_or_default();
+
+    // 1. 无感切换凭据至目标账号 (不触碰/不重载终端窗口)
+    let target_email = switch_account_credentials_only(target_id)?;
+
+    // 2. 调用 agy 隐藏进程执行最小 ping 请求 (仅 1 turn, 消耗 <0.2%)
+    let mut cmd = Command::new("agy.exe");
+    cmd.args(["--model", model, "-p", "ping", "--output-format", "json"]);
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let out_res = cmd.output();
+
+    // 3. 立即恢复原有活动账号凭据
+    if !orig_id.is_empty() && orig_id != target_id {
+        let _ = switch_account_credentials_only(&orig_id);
+    }
+
+    match out_res {
+        Ok(out) if out.status.success() => Ok(target_email),
+        Ok(out) => {
+            let err = String::from_utf8_lossy(&out.stderr);
+            Err(format!("预热响应异常: {}", err))
+        }
+        Err(e) => Err(format!("调用 agy.exe 失败: {}", e)),
+    }
+}
+
+fn prewarm_all_dormant_clocks(silent: bool) -> usize {
+    if !silent {
+        println!("\n{}[*] 正在扫描全账号池中沉睡的周配额时钟...{}", C_CYAN, C_RESET);
+    }
+    let (rows, _, _) = fetch_all_accounts_data();
+    let mut awakened = 0;
+
+    for r in &rows {
+        if let Some(p) = &r.parsed {
+            // 检查 Claude 是否处于 100% 满额休眠状态
+            let c_is_full = p.claude_weekly.unwrap_or(0.0) >= 0.995;
+            let c_cd = p.claude_weekly_countdown.as_deref().unwrap_or("");
+            let c_is_dormant = c_is_full && (c_cd == "满额" || c_cd.is_empty() || c_cd == "--");
+
+            if c_is_dormant {
+                if !silent {
+                    println!("  -> 账号 {}{}{} 的 Claude 周额度处于 100% 沉睡中，正在激活 7 天倒计时...", C_BOLD, r.acc.email, C_RESET);
+                }
+                match prewarm_account_clock(&r.acc.id, "claude-sonnet-4-6") {
+                    Ok(email) => {
+                        awakened += 1;
+                        let msg = format!("[唤醒] 账号 {} 的 Claude 周额度时钟已成功启动！(7天重置倒计时开始运转)", email);
+                        log_guard_event(&msg, silent);
+                        if !silent {
+                            println!("     {}{}[+] 唤醒成功！7 天周刷新倒计时已正式启动！{}", C_BOLD, C_GREEN, C_RESET);
+                        }
+                    }
+                    Err(e) => {
+                        let msg = format!("[唤醒失败] 账号 {} 激活失败: {}", r.acc.email, e);
+                        log_guard_event(&msg, silent);
+                        if !silent {
+                            println!("     {}{}[-] 唤醒失败: {}{}", C_BOLD, C_RED, e, C_RESET);
+                        }
+                    }
+                }
+            }
+
+            // 检查 Gemini 是否处于 100% 满额休眠状态
+            let g_is_full = p.gemini_weekly.unwrap_or(0.0) >= 0.995;
+            let g_cd = p.gemini_weekly_countdown.as_deref().unwrap_or("");
+            let g_is_dormant = g_is_full && (g_cd == "满额" || g_cd.is_empty() || g_cd == "--");
+
+            if g_is_dormant {
+                if !silent {
+                    println!("  -> 账号 {}{}{} 的 Gemini 周额度处于 100% 沉睡中，正在激活 7 天倒计时...", C_BOLD, r.acc.email, C_RESET);
+                }
+                match prewarm_account_clock(&r.acc.id, "gemini-3.8-flash-high") {
+                    Ok(email) => {
+                        awakened += 1;
+                        let msg = format!("[唤醒] 账号 {} 的 Gemini 周额度时钟已成功启动！(7天重置倒计时开始运转)", email);
+                        log_guard_event(&msg, silent);
+                        if !silent {
+                            println!("     {}{}[+] 唤醒成功！Gemini 7 天周刷新倒计时已正式启动！{}", C_BOLD, C_GREEN, C_RESET);
+                        }
+                    }
+                    Err(e) => {
+                        let msg = format!("[唤醒失败] 账号 {} Gemini 激活失败: {}", r.acc.email, e);
+                        log_guard_event(&msg, silent);
+                        if !silent {
+                            println!("     {}{}[-] Gemini 唤醒失败: {}{}", C_BOLD, C_RED, e, C_RESET);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !silent {
+        if awakened > 0 {
+            println!("\n{}{}[完成] 共成功唤醒并启动了 {} 个账号的周额度时钟！{}", C_BOLD, C_GREEN, awakened, C_RESET);
+        } else {
+            println!("\n{}[*] 账号池中所有账号的周额度时钟均已处于激活运转状态，无需预热。{}", C_DIM, C_RESET);
+        }
+    }
+
+    awakened
+}
+
+// -----------------------------------------------------------------------------
+// 全局默认模型管理 (Model Switcher)
+// -----------------------------------------------------------------------------
+fn get_cli_settings_path() -> PathBuf {
+    get_gemini_dir().join("antigravity-cli").join("settings.json")
+}
+
+fn get_active_model_setting() -> String {
+    let p = get_cli_settings_path();
+    if p.exists() {
+        if let Ok(c) = fs::read_to_string(p) {
+            if let Ok(v) = serde_json::from_str::<Value>(&c) {
+                if let Some(m) = v.get("model").and_then(|x| x.as_str()) {
+                    return m.to_string();
+                }
+            }
+        }
+    }
+    "Gemini 3.8 Flash (High)".to_string()
+}
+
+fn set_active_model_setting(model_name: &str) -> Result<(), String> {
+    let p = get_cli_settings_path();
+    let mut v: Value = if p.exists() {
+        fs::read_to_string(&p)
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or_else(|| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    v["model"] = Value::String(model_name.to_string());
+    let json_str = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
+    fs::write(p, json_str).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn option_switch_model() {
+    clear_screen();
+    let cur_model = get_active_model_setting();
+    println!("{}=== 切换全局默认模型 (Switch Default Model) ==={}", C_BOLD, C_RESET);
+    println!("当前全局默认模型: {}{}{}\n", C_CYAN, cur_model, C_RESET);
+    println!("请选择切换目标:");
+    println!("  {} [1] Claude Sonnet 4.6 (Thinking)  (深度推理与架构设计)", C_MAGENTA);
+    println!("  {} [2] Gemini 3.8 Flash (High)       (超快响应与代码极速生成)", C_BLUE);
+    println!("  {} [3] Gemini 3.1 Pro (High)         (超大上下文长文本分析)", C_BLUE);
+    println!("  {} [0] 返回主菜单{}", C_DIM, C_RESET);
+    print!("\n>> 请输入选项 [1-3, 0]: ");
+    let _ = io::stdout().flush();
+    let mut choice = String::new();
+    let _ = io::stdin().read_line(&mut choice);
+
+    let target_model = match choice.trim() {
+        "1" => Some("Claude Sonnet 4.6 (Thinking)"),
+        "2" => Some("Gemini 3.8 Flash (High)"),
+        "3" => Some("Gemini 3.1 Pro (High)"),
+        _ => None,
+    };
+
+    if let Some(m) = target_model {
+        if let Ok(()) = set_active_model_setting(m) {
+            println!("\n{}{}[+] 默认模型已成功更新为: {}{}", C_BOLD, C_GREEN, m, C_RESET);
+            println!("新启动的 agy 终端会话将默认直接加载该模型。");
+        } else {
+            println!("\n{}{}[-] 保存模型配置失败{}", C_BOLD, C_RED, C_RESET);
+        }
+        pause();
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -1771,6 +1964,12 @@ fn run_guard_daemon(silent: bool) {
     let mut last_quota_metric: Option<(Instant, f64)> = None;
     let mut calculated_burn_rate: Option<f64> = None;
 
+    // 启动时自动扫描并唤醒全账号池沉睡周额度时钟
+    let prewarm_cnt = prewarm_all_dormant_clocks(silent);
+    if prewarm_cnt > 0 {
+        log_guard_event(&format!("[预热] 守护初始化完成，已自动激活 {} 个账号的 7 天周刷新倒计时", prewarm_cnt), silent);
+    }
+
     loop {
         check_count += 1;
 
@@ -2067,10 +2266,11 @@ fn option_guard_management() {
         println!(" {}[2]{} 在后台静默启动守护进程 (脱机运行, 自动弹窗通知)", C_CYAN, C_RESET);
         println!(" {}[3]{} 停止正在运行的守护进程", C_YELLOW, C_RESET);
         println!(" {}[4]{} 查看守护服务最近运行日志 (最新 30 行)", C_CYAN, C_RESET);
+        println!(" {}[5]{} 立即唤醒全账号池沉睡周额度时钟 (提前激活7天倒计时)", C_MAGENTA, C_RESET);
         println!(" {}[0]{} 返回主菜单", C_RED, C_RESET);
         println!("{}----------------------------------------------------------------------{}", C_BOLD, C_RESET);
 
-        print!(">> 请选择操作 [0-4]: ");
+        print!(">> 请选择操作 [0-5]: ");
         let _ = io::stdout().flush();
         let mut sel = String::new();
         if io::stdin().read_line(&mut sel).is_err() {
@@ -2143,6 +2343,10 @@ fn option_guard_management() {
                 } else {
                     println!("\n{}[信息] 暂无守护运行日志。{}", C_DIM, C_RESET);
                 }
+                pause();
+            }
+            "5" => {
+                prewarm_all_dormant_clocks(false);
                 pause();
             }
             "0" | "q" | "quit" | "exit" => break,
@@ -2554,6 +2758,8 @@ fn run_cli_menu() {
         println!(" {}[3]{} 切换当前活动账号 (Switch Account - 交互选择 / 序号 / 邮箱)", C_CYAN, C_RESET);
         println!(" {}[4]{} 智能切至最高额度账号 (Auto-Switch to Best Quota Account)", C_CYAN, C_RESET);
         println!(" {}[A]{} 后台自动调配守护服务 (Auto-Guard Daemon - 监控/自动切号/通知)", C_GREEN, C_RESET);
+        println!(" {}[P]{} 一键唤醒全账号池沉睡周额度时钟 (Pre-warm Weekly Clocks - 提前激活7天倒计时)", C_MAGENTA, C_RESET);
+        println!(" {}[M]{} 切换全局默认模型 (Switch Default Model: Claude / Gemini)", C_BLUE, C_RESET);
         println!(" {}[5]{} 保存当前 agy 账号至账号池 (Save Active agy Account)", C_CYAN, C_RESET);
         println!(" {}[6]{} 添加新账号到账号池 (Add New Account - 浏览器授权 / Token)", C_CYAN, C_RESET);
         println!(" {}[7]{} 从账号池移除账号 (Remove Account)", C_CYAN, C_RESET);
@@ -2562,7 +2768,7 @@ fn run_cli_menu() {
         println!(" {}[0]{} 退出程序 (Exit)", C_RED, C_RESET);
         println!("{}======================================================================{}", C_BOLD, C_RESET);
 
-        print!(">> 请输入选项 {}[0-9/A]{}: ", C_BOLD, C_RESET);
+        print!(">> 请输入选项 {}[0-9/A/P/M]{}: ", C_BOLD, C_RESET);
         let _ = io::stdout().flush();
         let mut choice = String::new();
         if io::stdin().read_line(&mut choice).is_err() {
@@ -2575,6 +2781,11 @@ fn run_cli_menu() {
             "3" => option_switch_account(),
             "4" => option_auto_switch(),
             "a" | "A" => option_guard_management(),
+            "p" | "P" => {
+                prewarm_all_dormant_clocks(false);
+                pause();
+            }
+            "m" | "M" => option_switch_model(),
             "5" => option_save_current_account(),
             "6" => option_add_account(),
             "7" => option_remove_account(),
@@ -2781,6 +2992,31 @@ fn main() {
                     }
                 }
             }
+            "prewarm" | "warm" => {
+                prewarm_all_dormant_clocks(false);
+                return;
+            }
+            "model" => {
+                let sub2 = args.get(2).map(|s| s.as_str()).unwrap_or("");
+                match sub2 {
+                    "claude" | "sonnet" => {
+                        let _ = set_active_model_setting("Claude Sonnet 4.6 (Thinking)");
+                        println!("[+] 默认模型已切换为: Claude Sonnet 4.6 (Thinking)");
+                    }
+                    "gemini" | "flash" => {
+                        let _ = set_active_model_setting("Gemini 3.8 Flash (High)");
+                        println!("[+] 默认模型已切换为: Gemini 3.8 Flash (High)");
+                    }
+                    "pro" => {
+                        let _ = set_active_model_setting("Gemini 3.1 Pro (High)");
+                        println!("[+] 默认模型已切换为: Gemini 3.1 Pro (High)");
+                    }
+                    _ => {
+                        option_switch_model();
+                    }
+                }
+                return;
+            }
             "--help" | "-h" | "help" => {
                 println!("Antigravity (AGY) 多账号与配额管理中心 v2.0.0 (Rust Console)");
                 println!("用法:");
@@ -2793,6 +3029,8 @@ fn main() {
                 println!("  AGY多账号配额中心.exe guard --silent # 后台静默启动守护服务");
                 println!("  AGY多账号配额中心.exe guard --status # 查看守护服务运行状态");
                 println!("  AGY多账号配额中心.exe guard --stop   # 停止守护服务");
+                println!("  AGY多账号配额中心.exe prewarm    # 一键唤醒全账号池沉睡周额度时钟 (提前激活7天倒计时)");
+                println!("  AGY多账号配额中心.exe model      # 切换全局默认模型 (Claude / Gemini)");
                 println!("  AGY多账号配额中心.exe reload     # 手动触发所有运行中 agy 终端会话的热重载");
                 println!("  AGY多账号配额中心.exe save       # 保存当前账号快照");
                 return;
