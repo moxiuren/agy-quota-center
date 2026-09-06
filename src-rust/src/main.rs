@@ -1756,7 +1756,7 @@ fn run_guard_daemon(silent: bool) {
         println!("{}================================================================================{}", C_BOLD, C_RESET);
         println!("{}  >>> Antigravity (AGY) 智能配额自动调配守护服务 (Live Monitor) <<<{}", C_BOLD, C_RESET);
         println!("{}================================================================================{}", C_BOLD, C_RESET);
-        println!("  {}*{} 运行模式: 实时轮询 (每 20 秒自适应巡检与额度大盘同步)", C_CYAN, C_RESET);
+        println!("  {}*{} 运行模式: 智能动态自适应调频 (充沛区 120s / 待机 180s / 逼近阈值 25s)", C_CYAN, C_RESET);
         println!("  {}*{} 切号阈值: 当前账号 5h 余量 ≤ 15%、周余量 ≤ 10% 或遭遇 API 429 频控", C_CYAN, C_RESET);
         println!("  {}*{} 自动动作: 智能评分秒切最优账号 + 自动热重载终端会话 + Windows Toast 通知", C_CYAN, C_RESET);
         println!("  {}*{} 日志文件: {}", C_CYAN, C_RESET, get_guard_log_path().display());
@@ -1768,6 +1768,8 @@ fn run_guard_daemon(silent: bool) {
     let switch_cooldown = Duration::from_secs(60);
     let mut check_count: u64 = 0;
     let mut cached_candidates: Vec<(String, f64)> = Vec::new();
+    let mut last_quota_metric: Option<(Instant, f64)> = None;
+    let mut calculated_burn_rate: Option<f64> = None;
 
     loop {
         check_count += 1;
@@ -1857,6 +1859,36 @@ fn run_guard_daemon(silent: bool) {
             }
         };
 
+        let min_5h = cur_quota_opt.as_ref().map(|q| {
+            q.gemini_5h.unwrap_or(1.0).min(q.claude_5h.unwrap_or(1.0))
+        }).unwrap_or(1.0);
+
+        // 动态消耗速率与时间追踪
+        if let Some((prev_time, prev_q)) = last_quota_metric {
+            let elapsed_sec = prev_time.elapsed().as_secs();
+            if elapsed_sec >= 45 {
+                let dq = prev_q - min_5h;
+                if dq > 0.002 {
+                    let rate_per_min = (dq * 100.0) / (elapsed_sec as f64 / 60.0);
+                    calculated_burn_rate = Some(rate_per_min);
+                }
+                last_quota_metric = Some((Instant::now(), min_5h));
+            }
+        } else {
+            last_quota_metric = Some((Instant::now(), min_5h));
+        }
+
+        // 自适应调频周期计算 (大幅精简无谓轮询)
+        let (next_poll_sec, tier_name) = if agy_cnt == 0 {
+            (180, "待机监控 (3分钟/次)")
+        } else if min_5h > 0.50 {
+            (120, "充沛安全区 (2分钟/次)")
+        } else if min_5h > 0.25 {
+            (60, "平稳消耗区 (60秒/次)")
+        } else {
+            (25, "逼近阈值区 (25秒/次)")
+        };
+
         if let Some(q) = &cur_quota_opt {
             let g5 = q.gemini_5h.unwrap_or(1.0);
             let c5 = q.claude_5h.unwrap_or(1.0);
@@ -1918,11 +1950,30 @@ fn run_guard_daemon(silent: bool) {
             format!("{}[冷却防抖中 (剩余 {}s)]{}", C_YELLOW, rem_s, C_RESET)
         } else if need_switch {
             format!("{}[阈值告警触发: {} -> 立即切号！]{}", C_RED, trigger_reason, C_RESET)
-        } else if let Some(q) = &cur_quota_opt {
+        } else if let Some(rate) = calculated_burn_rate {
+            let rem_pct = (min_5h * 100.0 - 15.0).max(0.0);
+            let est_mins = rem_pct / rate.max(0.1);
+            let time_desc = if est_mins >= 60.0 {
+                format!("{:.1}小时后", est_mins / 60.0)
+            } else {
+                format!("{:.0}分钟后", est_mins.max(1.0))
+            };
             format!(
-                "{}[配额充沛 (综合评分: {:.1}) | 预计切号时机: 当 5h 余量 ≤ 15% 或遭遇 429 频控时自动秒切]{}",
-                C_GREEN, q.effective_score, C_RESET
+                "{}[稳态运行 | 消耗速度: {:.1}%/分 | 预计约 {} 触及 15% 阈值切号]{}",
+                C_GREEN, rate, time_desc, C_RESET
             )
+        } else if let Some(q) = &cur_quota_opt {
+            if min_5h > 0.50 {
+                format!(
+                    "{}[配额充沛 (综合评分: {:.1}) | 待机或低速中 | 预计切号: 2+小时以上 (当 5h 余量 ≤ 15% 时自动秒切)]{}",
+                    C_GREEN, q.effective_score, C_RESET
+                )
+            } else {
+                format!(
+                    "{}[余量适中 (综合评分: {:.1}) | 预计切号: 当 5h 余量 ≤ 15% 或遭遇 429 频控时自动秒切]{}",
+                    C_GREEN, q.effective_score, C_RESET
+                )
+            }
         } else {
             format!("{}[异常待查]{}", C_YELLOW, C_RESET)
         };
@@ -1939,8 +1990,8 @@ fn run_guard_daemon(silent: bool) {
         };
 
         let log_text = format!(
-            "[巡检 #{}] 状态: {} | 活动账号: {}{}{}\n  -> 配额余量: {}\n  -> 调度评估: {}\n  -> 备选队列: {}",
-            check_count, proc_desc, C_BOLD, cur_email, C_RESET, quota_line, status_desc, candidate_line
+            "[巡检 #{}] 状态: {} | 活动账号: {}{}{}\n  -> 配额余量: {}\n  -> 调度评估: {}\n  -> 备选队列: {}\n  -> 下次巡检: {} 秒后 [{}]",
+            check_count, proc_desc, C_BOLD, cur_email, C_RESET, quota_line, status_desc, candidate_line, next_poll_sec, tier_name
         );
         log_guard_event(&log_text, silent);
 
@@ -1982,7 +2033,7 @@ fn run_guard_daemon(silent: bool) {
             }
         }
 
-        std::thread::sleep(Duration::from_secs(20));
+        std::thread::sleep(Duration::from_secs(next_poll_sec));
     }
 
     remove_guard_pid();
@@ -2683,6 +2734,22 @@ fn main() {
                 match sub2 {
                     "--silent" | "-s" => {
                         run_guard_daemon(true);
+                        return;
+                    }
+                    "--bg" | "--background" => {
+                        if let Some(pid) = read_guard_pid() {
+                            println!("[!] 守护服务已在运行中 (PID: {})", pid);
+                            return;
+                        }
+                        if let Ok(exe_path) = std::env::current_exe() {
+                            match Command::new(&exe_path)
+                                .args(["guard", "--silent"])
+                                .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+                                .spawn() {
+                                Ok(child) => println!("[+] 守护进程已成功在后台启动 (PID: {})", child.id()),
+                                Err(e) => eprintln!("[-] 启动后台守护失败: {}", e),
+                            }
+                        }
                         return;
                     }
                     "--status" => {
