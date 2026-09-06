@@ -25,7 +25,7 @@
 - **智能配额熔断与自动切换**：持续监控 5 小时与每周配额余量。当活跃账号配额降至 15% 临界阈值时，自动触发抢先式切号。
 - **跨终端协同热重载 (Zero-Collision)**：通过 Win32 控制台输入接口实现优雅重启，精准提取会话专属 UUID，多窗口并发运行互不冲突。
 - **周配额时钟预热唤醒 (Pre-warm)**：通过轻量探针请求，激活账号池内沉睡的 Claude 7 天重置倒计时，确保备用账号随时处于滚动刷新状态。
-- **全局默认模型无缝切换**：支持在 Claude Sonnet 4.6 (Thinking)、Gemini 3.8 Flash (High) 与 Gemini 3.1 Pro (High) 之间即时切换。
+- **全局默认模型无缝切换**：支持在 Claude Sonnet 4.6 (Thinking)、Claude Opus 4.6 (Thinking)、Gemini 3.8 Flash (High) 与 Gemini 3.1 Pro (High) 之间即时切换。
 - **全账号配额总览看板**：直观展示账号池内各账号的 Gemini 与 Claude 额度比例及具体刷新倒计时。
 - **后台脱机守护服务**：支持后台无窗口常驻运行，状态变更自动通过 Windows 原生通知提醒。
 
@@ -75,7 +75,7 @@
 | **切至最高额度账号** | `4` | 自动计算综合评分最优账号并切换，协同重载终端 |
 | **启动自动守护服务** | `A` | 开启后台自动监控，配额不足时自动切换并通过系统通知提醒 |
 | **激活周额度时钟** | `P` | 批量唤醒账号池内尚未启动 7 天倒计时的账号 |
-| **切换全局默认模型** | `M` | 选择 Claude 3.7 或 Gemini 作为全局默认调用模型 |
+| **切换全局默认模型** | `M` | 选择 Claude (Sonnet / Opus) 或 Gemini 作为全局默认调用模型 |
 | **导入新 Google 账号** | `6` | 支持浏览器授权或粘贴 Refresh Token 录入账号池 |
 
 ---
@@ -103,7 +103,8 @@ AGY_Quota_Center_v2.3.0.exe guard --stop
 # 批量预热沉睡的周配额时钟
 AGY_Quota_Center_v2.3.0.exe prewarm
 
-# 切换全局默认模型 (claude / flash / pro)
+# 切换全局默认模型 (claude / opus / flash / pro)
+AGY_Quota_Center_v2.3.0.exe model opus
 AGY_Quota_Center_v2.3.0.exe model claude
 ```
 

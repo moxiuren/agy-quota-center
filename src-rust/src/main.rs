@@ -1354,18 +1354,20 @@ fn option_switch_model() {
     println!("当前全局默认模型: {}{}{}\n", C_CYAN, cur_model, C_RESET);
     println!("请选择切换目标:");
     println!("  {} [1] Claude Sonnet 4.6 (Thinking)  (深度推理与架构设计)", C_MAGENTA);
-    println!("  {} [2] Gemini 3.8 Flash (High)       (超快响应与代码极速生成)", C_BLUE);
-    println!("  {} [3] Gemini 3.1 Pro (High)         (超大上下文长文本分析)", C_BLUE);
+    println!("  {} [2] Claude Opus 4.6 (Thinking)    (终极推理与长链复杂任务)", C_MAGENTA);
+    println!("  {} [3] Gemini 3.8 Flash (High)       (超快响应与代码极速生成)", C_BLUE);
+    println!("  {} [4] Gemini 3.1 Pro (High)         (超大上下文长文本分析)", C_BLUE);
     println!("  {} [0] 返回主菜单{}", C_DIM, C_RESET);
-    print!("\n>> 请输入选项 [1-3, 0]: ");
+    print!("\n>> 请输入选项 [1-4, 0]: ");
     let _ = io::stdout().flush();
     let mut choice = String::new();
     let _ = io::stdin().read_line(&mut choice);
 
     let target_model = match choice.trim() {
         "1" => Some("Claude Sonnet 4.6 (Thinking)"),
-        "2" => Some("Gemini 3.8 Flash (High)"),
-        "3" => Some("Gemini 3.1 Pro (High)"),
+        "2" => Some("Claude Opus 4.6 (Thinking)"),
+        "3" => Some("Gemini 3.8 Flash (High)"),
+        "4" => Some("Gemini 3.1 Pro (High)"),
         _ => None,
     };
 
@@ -3002,6 +3004,10 @@ fn main() {
                     "claude" | "sonnet" => {
                         let _ = set_active_model_setting("Claude Sonnet 4.6 (Thinking)");
                         println!("[+] 默认模型已切换为: Claude Sonnet 4.6 (Thinking)");
+                    }
+                    "opus" => {
+                        let _ = set_active_model_setting("Claude Opus 4.6 (Thinking)");
+                        println!("[+] 默认模型已切换为: Claude Opus 4.6 (Thinking)");
                     }
                     "gemini" | "flash" => {
                         let _ = set_active_model_setting("Gemini 3.8 Flash (High)");
