@@ -2748,7 +2748,7 @@ fn run_cli_menu() {
         clear_screen();
         let (email, tier) = get_current_active_info();
         println!("{}======================================================================{}", C_BOLD, C_RESET);
-        println!("{} >>> Antigravity (AGY) 多账号与配额管理中心 v2.0.0 (Rust) <<<{}", C_BOLD, C_RESET);
+        println!("{} >>> Antigravity (AGY) 多账号与配额管理中心 v2.3.0 (Rust) <<<{}", C_BOLD, C_RESET);
         println!("{}======================================================================{}", C_BOLD, C_RESET);
         println!(" 当前活动账号: {}{}{}  |  套餐类型: {}{}{}", C_WHITE, email, C_RESET, C_YELLOW, tier, C_RESET);
         println!(" 系统本地时间: {}{}{}", C_DIM, Local::now().format("%Y-%m-%d %H:%M:%S"), C_RESET);
@@ -3018,7 +3018,7 @@ fn main() {
                 return;
             }
             "--help" | "-h" | "help" => {
-                println!("Antigravity (AGY) 多账号与配额管理中心 v2.0.0 (Rust Console)");
+                println!("Antigravity (AGY) 多账号与配额管理中心 v2.3.0 (Rust Console)");
                 println!("用法:");
                 println!("  AGY多账号配额中心.exe            # 默认打开交互式黑窗口控制台菜单");
                 println!("  AGY多账号配额中心.exe usage      # 直接输出当前各账号配额对比表");
