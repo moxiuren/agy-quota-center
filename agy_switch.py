@@ -63,24 +63,26 @@ def get_accounts_with_quota():
     with ThreadPoolExecutor(max_workers=5) as executor:
         results = list(executor.map(worker, accounts))
 
-    # Find best candidate (exclude current and 403/errors)
-    best_acc = None
-    best_score = -1.0
+    # Calculate current account score
+    cur_score = -1.0
+    for acc, summary, err, parsed, eff in results:
+        if acc['id'] == current_id and not err and parsed:
+            cur_score = eff
+            break
+
+    # Find best candidate among alternative accounts
+    best_other_acc = None
+    best_other_score = -1.0
     for acc, summary, err, parsed, eff in results:
         if err or not parsed:
             continue
         if acc['id'] == current_id:
             continue
-        if eff > best_score:
-            best_score = eff
-            best_acc = acc
+        if eff > best_other_score:
+            best_other_score = eff
+            best_other_acc = acc
 
-    # If all others failed, check if current is available
-    if not best_acc:
-        for acc, summary, err, parsed, eff in results:
-            if not err and parsed and eff > best_score:
-                best_score = eff
-                best_acc = acc
+    best_acc = best_other_acc if (best_other_score > cur_score + 1.0 or cur_score < 10.0) and best_other_score > 0.0 else None
 
     return results, current_id, best_acc
 

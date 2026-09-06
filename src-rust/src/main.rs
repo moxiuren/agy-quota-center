@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local, Utc};
 use serde::{Deserialize, Serialize};
@@ -857,6 +857,7 @@ struct ParsedQuota {
     claude_weekly_reset: Option<String>,
     claude_weekly_countdown: Option<String>,
     effective_score: f64,
+    score_desc: String,
 }
 
 fn format_compact_countdown(target_iso: Option<&str>, frac: Option<f64>) -> String {
@@ -931,6 +932,85 @@ fn format_relative_time(iso_str: &str) -> (String, String) {
     }
 }
 
+fn score_single_model(frac_5h: Option<f64>, frac_w: Option<f64>, w_reset_iso: Option<&str>) -> (f64, &'static str) {
+    let f5 = frac_5h.unwrap_or(0.0);
+    let fw = frac_w.unwrap_or(0.0);
+
+    if f5 <= 0.001 && fw <= 0.001 {
+        return (0.0, "已耗尽");
+    }
+
+    // 基础容量：45% 即时5小时突发算力 + 55% 每周持久续航
+    let base = f5 * 0.45 + fw * 0.55;
+
+    // 每周余量健康惩罚 (Damping)
+    let (w_mult, w_status) = if fw < 0.15 {
+        (0.15, "周额告急")
+    } else if fw < 0.25 {
+        (0.45, "周额偏低")
+    } else if fw < 0.50 {
+        (0.85, "周额正常")
+    } else {
+        (1.0, "周额充足")
+    };
+
+    // 5小时短期余量惩罚
+    let (h5_mult, h5_status) = if f5 < 0.05 {
+        (0.05, "5h触底")
+    } else if f5 < 0.20 {
+        (0.70, "5h偏紧")
+    } else {
+        (1.0, "5h充沛")
+    };
+
+    // 周额度临近刷新紧迫度奖励 ("即将重置，抓紧释放")
+    let mut urgency_mult = 1.0;
+    let mut is_urgent = false;
+    if fw >= 0.20 {
+        if let Some(iso) = w_reset_iso {
+            if let Ok(dt) = DateTime::parse_from_rfc3339(iso) {
+                let diff_sec = dt.signed_duration_since(Utc::now()).num_seconds();
+                if diff_sec > 0 && diff_sec < 18 * 3600 {
+                    urgency_mult = 1.15;
+                    is_urgent = true;
+                }
+            }
+        }
+    }
+
+    let model_score = base * w_mult * h5_mult * urgency_mult;
+    let desc = if is_urgent {
+        "即将重置"
+    } else if f5 < 0.05 {
+        h5_status
+    } else if fw < 0.15 {
+        w_status
+    } else {
+        w_status
+    };
+
+    (model_score, desc)
+}
+
+fn calculate_smart_score(
+    g_5h: Option<f64>,
+    g_w: Option<f64>,
+    g_w_reset: Option<&str>,
+    c_5h: Option<f64>,
+    c_w: Option<f64>,
+    c_w_reset: Option<&str>,
+) -> (f64, String) {
+    let (g_score, g_tag) = score_single_model(g_5h, g_w, g_w_reset);
+    let (c_score, c_tag) = score_single_model(c_5h, c_w, c_w_reset);
+
+    // 双模型加权调度总分 (Gemini 45% + Claude 55%) * 100.0
+    let total_score = (g_score * 0.45 + c_score * 0.55) * 100.0;
+    let rounded_score = (total_score * 10.0).round() / 10.0;
+    let desc = format!("G:[{}] C:[{}]", g_tag, c_tag);
+
+    (rounded_score, desc)
+}
+
 fn parse_quota_buckets(summary: &Value) -> ParsedQuota {
     let mut q = ParsedQuota::default();
     if let Some(groups) = summary.get("groups").and_then(|g| g.as_array()) {
@@ -969,9 +1049,16 @@ fn parse_quota_buckets(summary: &Value) -> ParsedQuota {
     q.claude_5h_countdown = Some(format_compact_countdown(q.claude_5h_reset.as_deref(), q.claude_5h));
     q.claude_weekly_countdown = Some(format_compact_countdown(q.claude_weekly_reset.as_deref(), q.claude_weekly));
 
-    let g_eff = q.gemini_5h.unwrap_or(0.0).min(q.gemini_weekly.unwrap_or(0.0));
-    let c_eff = q.claude_5h.unwrap_or(0.0).min(q.claude_weekly.unwrap_or(0.0));
-    q.effective_score = g_eff * 0.4 + c_eff * 0.6;
+    let (score, desc) = calculate_smart_score(
+        q.gemini_5h,
+        q.gemini_weekly,
+        q.gemini_weekly_reset.as_deref(),
+        q.claude_5h,
+        q.claude_weekly,
+        q.claude_weekly_reset.as_deref(),
+    );
+    q.effective_score = score;
+    q.score_desc = desc;
 
     q
 }
@@ -1249,19 +1336,33 @@ fn fetch_all_accounts_data() -> (Vec<AccountRow>, Option<String>, Option<Account
         });
     }
 
-    let mut best_score = -1.0;
-    let mut best_acc: Option<AccountSummary> = None;
+    let cur_score = rows
+        .iter()
+        .find(|r| current_id.as_deref() == Some(&r.acc.id))
+        .and_then(|r| r.parsed.as_ref())
+        .map(|p| p.effective_score)
+        .unwrap_or(-1.0);
+
+    let mut best_other_score = -1.0;
+    let mut best_other_acc: Option<AccountSummary> = None;
     for r in &rows {
         let is_cur = current_id.as_deref() == Some(&r.acc.id);
         if !is_cur {
             if let Some(p) = &r.parsed {
-                if p.effective_score > best_score {
-                    best_score = p.effective_score;
-                    best_acc = Some(r.acc.clone());
+                if p.effective_score > best_other_score {
+                    best_other_score = p.effective_score;
+                    best_other_acc = Some(r.acc.clone());
                 }
             }
         }
     }
+
+    // 若其他账号得分比当前账号高出 1 分以上，或者当前账号已告急耗尽 (得分 < 10 分)，推荐切换
+    let best_acc = if (best_other_score > cur_score + 1.0 || cur_score < 10.0) && best_other_score > 0.0 {
+        best_other_acc
+    } else {
+        None
+    };
 
     (rows, current_id, best_acc)
 }
@@ -1507,10 +1608,23 @@ fn option_switch_account() {
 // [4] 智能切至最高额度账号
 fn option_auto_switch() {
     clear_screen();
-    println!("\n{}{}[*] 正在智能分析各账号木桶短板余量 min(5h, weekly)...{}", C_BOLD, C_CYAN, C_RESET);
-    let (_rows, _current_id, best_acc) = fetch_all_accounts_data();
+    println!("\n{}{}[*] 正在智能分析各账号 5h / 周额度综合调度得分...{}", C_BOLD, C_CYAN, C_RESET);
+    let (rows, current_id, best_acc) = fetch_all_accounts_data();
+
+    println!("\n各账号智能综合调度评分:");
+    for (idx, r) in rows.iter().enumerate() {
+        let is_cur = current_id.as_deref() == Some(&r.acc.id);
+        let tag = if is_cur { "[当前*]" } else { "       " };
+        let score_str = match &r.parsed {
+            Some(p) => format!("{:5.1} 分 ({})", p.effective_score, p.score_desc),
+            None => format!("  0.0 分 ({})", r.err.as_deref().unwrap_or("异常")),
+        };
+        println!("  {} [{}] {:26} -> {}", tag, idx + 1, r.acc.email, score_str);
+    }
+    println!();
+
     if let Some(best) = best_acc {
-        println!("[*] 找到最高推荐账号: {}{}{}{}", C_BOLD, C_MAGENTA, best.email, C_RESET);
+        println!("[*] 找到更优推荐账号: {}{}{}{}", C_BOLD, C_MAGENTA, best.email, C_RESET);
         match switch_account_by_id(&best.id) {
             Ok((email, count)) => {
                 println!("\n{}{}[+] 智能切换成功！已切至最优配额账号: {}{}", C_BOLD, C_GREEN, email, C_RESET);
@@ -1525,9 +1639,337 @@ fn option_auto_switch() {
             }
         }
     } else {
-        println!("\n{}[!] 当前活动账号即为最高额度账号，无需切换。{}", C_YELLOW, C_RESET);
+        println!("{}[!] 当前活动账号即为最高额度账号，配额充沛，无需切换。{}", C_YELLOW, C_RESET);
     }
     pause();
+}
+
+// -----------------------------------------------------------------------------
+// Auto-Guard Daemon (后台自动调配守护服务)
+// -----------------------------------------------------------------------------
+fn get_guard_pid_path() -> PathBuf {
+    get_gemini_dir().join("agy_guard.pid")
+}
+
+fn get_guard_log_path() -> PathBuf {
+    get_gemini_dir().join("agy_guard.log")
+}
+
+fn is_process_running(pid: u32) -> bool {
+    unsafe {
+        let h = OpenProcess(SYNCHRONIZE, 0, pid);
+        if !h.is_null() && h != (-1isize as *mut std::ffi::c_void) {
+            let res = WaitForSingleObject(h, 0);
+            CloseHandle(h);
+            res == 0x102 // WAIT_TIMEOUT
+        } else {
+            false
+        }
+    }
+}
+
+fn read_guard_pid() -> Option<u32> {
+    let p = get_guard_pid_path();
+    if p.exists() {
+        if let Ok(s) = fs::read_to_string(&p) {
+            if let Ok(pid) = s.trim().parse::<u32>() {
+                if is_process_running(pid) {
+                    return Some(pid);
+                }
+            }
+        }
+        let _ = fs::remove_file(p);
+    }
+    None
+}
+
+fn write_guard_pid(pid: u32) {
+    let _ = fs::write(get_guard_pid_path(), pid.to_string());
+}
+
+fn remove_guard_pid() {
+    let _ = fs::remove_file(get_guard_pid_path());
+}
+
+fn stop_guard_daemon() -> bool {
+    if let Some(pid) = read_guard_pid() {
+        log_guard_event(&format!("[停止] 收到终止指令，正在停止守护服务 (PID: {})...", pid), true);
+        unsafe {
+            let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if !h.is_null() && h != (-1isize as *mut std::ffi::c_void) {
+                let _ = TerminateProcess(h, 0);
+                CloseHandle(h);
+            }
+        }
+        remove_guard_pid();
+        log_guard_event("[停止] 守护服务已停止", true);
+        true
+    } else {
+        false
+    }
+}
+
+fn log_guard_event(msg: &str, silent: bool) {
+    let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let line = format!("[{}] {}\n", now, msg);
+    if !silent {
+        print!("{}", line);
+        let _ = io::stdout().flush();
+    }
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(get_guard_log_path()) {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+fn send_desktop_notification(title: &str, message: &str) {
+    let clean_title = title.replace('\'', " ").replace('"', " ").replace('<', " ").replace('>', " ");
+    let clean_msg = message.replace('\'', " ").replace('"', " ").replace('<', " ").replace('>', " ");
+    let ps_script = format!(
+        r#"[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null; [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null; $x = [Windows.Data.Xml.Dom.XmlDocument]::new(); $x.LoadXml('<toast><visual><binding template="ToastGeneric"><text>{}</text><text>{}</text></binding></visual></toast>'); $t = [Windows.UI.Notifications.ToastNotification]::new($x); [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}}\cmd.exe').Show($t);"#,
+        clean_title, clean_msg
+    );
+    let _ = Command::new("powershell.exe")
+        .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps_script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn();
+}
+
+fn run_guard_daemon(silent: bool) {
+    let my_pid = unsafe { GetCurrentProcessId() };
+
+    if let Some(existing_pid) = read_guard_pid() {
+        if existing_pid != my_pid {
+            let msg = format!("[!] 守护服务已在运行中 (PID: {})，无需重复启动。", existing_pid);
+            if !silent {
+                println!("{}", msg);
+            }
+            return;
+        }
+    }
+
+    write_guard_pid(my_pid);
+    log_guard_event(&format!("[启动] Antigravity 智能配额守护服务已启动 (PID: {})", my_pid), silent);
+
+    if !silent {
+        println!("{}[*] 守护服务持续监听活动 agy 终端会话与配额状态...", C_CYAN);
+        println!("  - 当无 agy 运行：休眠待机 (零 API 开销)");
+        println!("  - 当有 agy 运行：每 35 秒轮询检测当前账号 5h / 周配额");
+        println!("  - 触发阈值：当前账号 5h <= 5% 或遭遇 429 频控");
+        println!("  - 触发动作：智能评分切换最优账号 + 自动热重载终端会话 + Windows Toast 桌面通知");
+        println!("  - 按 Ctrl+C 可安全退出守护监听\n{}", C_RESET);
+    }
+
+    let mut last_switch_time: Option<Instant> = None;
+    let switch_cooldown = Duration::from_secs(90);
+
+    loop {
+        if let Some(cur_pid) = read_guard_pid() {
+            if cur_pid != my_pid {
+                log_guard_event("[退出] 检测到新的守护实例启动或 PID 发生变更，当前守护正常退出", silent);
+                break;
+            }
+        } else {
+            log_guard_event("[退出] PID 文件被移除，守护服务正常退出", silent);
+            break;
+        }
+
+        let procs = get_all_agy_processes();
+        if procs.is_empty() {
+            std::thread::sleep(Duration::from_secs(60));
+            continue;
+        }
+
+        if let Some(last_time) = last_switch_time {
+            if last_time.elapsed() < switch_cooldown {
+                std::thread::sleep(Duration::from_secs(15));
+                continue;
+            }
+        }
+
+        let (active_email, _) = get_current_active_info();
+        let idx = load_account_index();
+        let current_acc_opt = idx.accounts.iter().find(|a| {
+            if let Some(cid) = &idx.current_account_id {
+                a.id == *cid
+            } else {
+                a.email.eq_ignore_ascii_case(&active_email)
+            }
+        }).or_else(|| {
+            idx.accounts.iter().find(|a| a.email.eq_ignore_ascii_case(&active_email))
+        });
+
+        let mut need_switch = false;
+        let mut trigger_reason = String::new();
+
+        if let Some(acc_meta) = current_acc_opt {
+            if let Some(mut acc) = load_account(&acc_meta.id) {
+                match ensure_valid_token(&mut acc) {
+                    Ok(tok) => match fetch_quota_summary(&tok) {
+                        Ok(sum) => {
+                            let q = parse_quota_buckets(&sum);
+                            let g5 = q.gemini_5h.unwrap_or(1.0);
+                            let c5 = q.claude_5h.unwrap_or(1.0);
+                            if g5 <= 0.05 || c5 <= 0.05 {
+                                need_switch = true;
+                                trigger_reason = format!(
+                                    "当前账号 [{}] 5h额度触底 (G: {:.0}%, C: {:.0}%)",
+                                    acc.email, g5 * 100.0, c5 * 100.0
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            if e.contains("429") || e.contains("ResourceExhausted") || e.contains("RESOURCE_EXHAUSTED") {
+                                need_switch = true;
+                                trigger_reason = format!("当前账号 [{}] 遭遇 API 429 频控配额耗尽", acc.email);
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        log_guard_event(&format!("[警告] 刷新当前账号 Token 失败: {}", e), silent);
+                    }
+                }
+            }
+        }
+
+        if need_switch {
+            log_guard_event(&format!("[触发] 告警触发: {}", trigger_reason), silent);
+
+            let (_rows, _, best_acc) = fetch_all_accounts_data();
+            if let Some(best) = best_acc {
+                log_guard_event(&format!("[调配] 正在执行智能切号，目标最优账号: {}", best.email), silent);
+                match switch_account_by_id(&best.id) {
+                    Ok((switched_email, reloaded_cnt)) => {
+                        let ok_msg = format!(
+                            "[成功] 已自动切至最优账号: {} | 热重载恢复 {} 个 agy 终端会话",
+                            switched_email, reloaded_cnt
+                        );
+                        log_guard_event(&ok_msg, silent);
+                        send_desktop_notification(
+                            "Antigravity 配额自动调配",
+                            &format!("当前额度耗尽，已自动切至最优账号: {}\n已恢复 {} 个终端会话", switched_email, reloaded_cnt),
+                        );
+                        last_switch_time = Some(Instant::now());
+                    }
+                    Err(e) => {
+                        let err_msg = format!("[错误] 智能切号失败: {}", e);
+                        log_guard_event(&err_msg, silent);
+                    }
+                }
+            } else {
+                let warn_msg = "[警告] 账号池中无其他更高额度可用账号，全部耗尽或受限";
+                log_guard_event(warn_msg, silent);
+                send_desktop_notification(
+                    "Antigravity 配额告警",
+                    "账号池中所有账号配额均已耗尽，请等待最近窗口刷新！",
+                );
+                std::thread::sleep(Duration::from_secs(120));
+            }
+        }
+
+        std::thread::sleep(Duration::from_secs(35));
+    }
+
+    remove_guard_pid();
+    log_guard_event("[停止] 守护服务已退出", silent);
+}
+
+fn option_guard_management() {
+    loop {
+        clear_screen();
+        println!("\n{}{}[=== AGY 智能配额自动调配守护服务 ===]{}", C_BOLD, C_CYAN, C_RESET);
+
+        let pid_opt = read_guard_pid();
+        let is_running = pid_opt.is_some();
+        let status_str = if let Some(pid) = pid_opt {
+            format!("{}[运行中 (PID: {})]{}", C_GREEN, pid, C_RESET)
+        } else {
+            format!("{}[未运行]{}", C_DIM, C_RESET)
+        };
+
+        println!("守护状态: {}", status_str);
+        println!("日志路径: {}\n", get_guard_log_path().display());
+
+        println!(" {}[1]{} 在前台运行守护监听 (实时查看日志, Ctrl+C 退出)", C_CYAN, C_RESET);
+        println!(" {}[2]{} 在后台静默启动守护进程 (脱机运行, 自动弹窗通知)", C_CYAN, C_RESET);
+        println!(" {}[3]{} 停止正在运行的守护进程", C_YELLOW, C_RESET);
+        println!(" {}[4]{} 查看守护服务最近运行日志 (最新 30 行)", C_CYAN, C_RESET);
+        println!(" {}[0]{} 返回主菜单", C_RED, C_RESET);
+        println!("{}----------------------------------------------------------------------{}", C_BOLD, C_RESET);
+
+        print!(">> 请选择操作 [0-4]: ");
+        let _ = io::stdout().flush();
+        let mut sel = String::new();
+        if io::stdin().read_line(&mut sel).is_err() {
+            break;
+        }
+
+        match sel.trim() {
+            "1" => {
+                if is_running {
+                    println!("\n{}[!] 守护服务已在后台运行中。如需前台运行，请先停止后台进程。{}", C_YELLOW, C_RESET);
+                    pause();
+                } else {
+                    println!("\n[*] 正在启动前台守护监听 (按 Ctrl+C 可退出)...\n");
+                    run_guard_daemon(false);
+                    pause();
+                }
+            }
+            "2" => {
+                if is_running {
+                    println!("\n{}[!] 守护服务已在运行中 (PID: {})。{}", C_YELLOW, pid_opt.unwrap(), C_RESET);
+                } else {
+                    if let Ok(exe_path) = std::env::current_exe() {
+                        let spawn_res = Command::new(&exe_path)
+                            .args(["guard", "--silent"])
+                            .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+                            .spawn();
+                        match spawn_res {
+                            Ok(child) => {
+                                println!("\n{}{}[+] 守护进程已成功在后台静默启动！(PID: {}){}", C_BOLD, C_GREEN, child.id(), C_RESET);
+                                println!("{}[提示] 守护进程将在检测到额度耗尽时自动切号并通过系统通知提示。{}", C_DIM, C_RESET);
+                            }
+                            Err(e) => {
+                                println!("\n{}{}[-] 启动后台守护失败: {}{}", C_BOLD, C_RED, e, C_RESET);
+                            }
+                        }
+                    }
+                }
+                pause();
+            }
+            "3" => {
+                if stop_guard_daemon() {
+                    println!("\n{}{}[+] 守护服务已成功停止！{}", C_BOLD, C_GREEN, C_RESET);
+                } else {
+                    println!("\n{}[!] 当前未检测到运行中的守护服务。{}", C_YELLOW, C_RESET);
+                }
+                pause();
+            }
+            "4" => {
+                let log_path = get_guard_log_path();
+                if log_path.exists() {
+                    if let Ok(content) = fs::read_to_string(&log_path) {
+                        let lines: Vec<&str> = content.lines().collect();
+                        let start = lines.len().saturating_sub(30);
+                        println!("\n{}{}[--- 守护日志最新 30 行 ---]{}\n", C_BOLD, C_WHITE, C_RESET);
+                        for l in &lines[start..] {
+                            println!("{}", l);
+                        }
+                        println!("\n{}{}[--- 日志结束 ---]{}", C_BOLD, C_WHITE, C_RESET);
+                    } else {
+                        println!("\n{}[-] 读取日志文件失败。{}", C_RED, C_RESET);
+                    }
+                } else {
+                    println!("\n{}[信息] 暂无守护运行日志。{}", C_DIM, C_RESET);
+                }
+                pause();
+            }
+            "0" | "q" | "quit" | "exit" => break,
+            _ => {
+                println!("{}[!] 无效选项，请重新输入。{}", C_RED, C_RESET);
+                std::thread::sleep(Duration::from_millis(600));
+            }
+        }
+    }
 }
 
 // [5] 保存当前 agy 账号至账号池
@@ -1929,6 +2371,7 @@ fn run_cli_menu() {
         println!(" {}[2]{} 查看所有账号全局大盘 (All Accounts Overview)", C_CYAN, C_RESET);
         println!(" {}[3]{} 切换当前活动账号 (Switch Account - 交互选择 / 序号 / 邮箱)", C_CYAN, C_RESET);
         println!(" {}[4]{} 智能切至最高额度账号 (Auto-Switch to Best Quota Account)", C_CYAN, C_RESET);
+        println!(" {}[A]{} 后台自动调配守护服务 (Auto-Guard Daemon - 监控/自动切号/通知)", C_GREEN, C_RESET);
         println!(" {}[5]{} 保存当前 agy 账号至账号池 (Save Active agy Account)", C_CYAN, C_RESET);
         println!(" {}[6]{} 添加新账号到账号池 (Add New Account - 浏览器授权 / Token)", C_CYAN, C_RESET);
         println!(" {}[7]{} 从账号池移除账号 (Remove Account)", C_CYAN, C_RESET);
@@ -1937,7 +2380,7 @@ fn run_cli_menu() {
         println!(" {}[0]{} 退出程序 (Exit)", C_RED, C_RESET);
         println!("{}======================================================================{}", C_BOLD, C_RESET);
 
-        print!(">> 请输入选项 {}[0-9]{}: ", C_BOLD, C_RESET);
+        print!(">> 请输入选项 {}[0-9/A]{}: ", C_BOLD, C_RESET);
         let _ = io::stdout().flush();
         let mut choice = String::new();
         if io::stdin().read_line(&mut choice).is_err() {
@@ -1949,6 +2392,7 @@ fn run_cli_menu() {
             "2" => option_view_all_accounts(),
             "3" => option_switch_account(),
             "4" => option_auto_switch(),
+            "a" | "A" => option_guard_management(),
             "5" => option_save_current_account(),
             "6" => option_add_account(),
             "7" => option_remove_account(),
@@ -2110,6 +2554,35 @@ fn main() {
                 option_save_current_account();
                 return;
             }
+            "guard" | "daemon" => {
+                let sub2 = args.get(2).map(|s| s.as_str()).unwrap_or("");
+                match sub2 {
+                    "--silent" | "-s" => {
+                        run_guard_daemon(true);
+                        return;
+                    }
+                    "--status" => {
+                        if let Some(pid) = read_guard_pid() {
+                            println!("[+] 守护服务正在运行中 (PID: {})", pid);
+                        } else {
+                            println!("[*] 守护服务未运行");
+                        }
+                        return;
+                    }
+                    "--stop" => {
+                        if stop_guard_daemon() {
+                            println!("[+] 守护服务已停止");
+                        } else {
+                            println!("[*] 未检测到运行中的守护服务");
+                        }
+                        return;
+                    }
+                    _ => {
+                        run_guard_daemon(false);
+                        return;
+                    }
+                }
+            }
             "--help" | "-h" | "help" => {
                 println!("Antigravity (AGY) 多账号与配额管理中心 v2.0.0 (Rust Console)");
                 println!("用法:");
@@ -2118,6 +2591,10 @@ fn main() {
                 println!("  AGY多账号配额中心.exe accounts   # 列出所有账号");
                 println!("  AGY多账号配额中心.exe switch <序号/邮箱> # 切换活动账号并自动热重载终端");
                 println!("  AGY多账号配额中心.exe auto       # 自动切至最高额度账号并自动热重载终端");
+                println!("  AGY多账号配额中心.exe guard      # 前台启动守护监听 (按 Ctrl+C 退出)");
+                println!("  AGY多账号配额中心.exe guard --silent # 后台静默启动守护服务");
+                println!("  AGY多账号配额中心.exe guard --status # 查看守护服务运行状态");
+                println!("  AGY多账号配额中心.exe guard --stop   # 停止守护服务");
                 println!("  AGY多账号配额中心.exe reload     # 手动触发所有运行中 agy 终端会话的热重载");
                 println!("  AGY多账号配额中心.exe save       # 保存当前账号快照");
                 return;

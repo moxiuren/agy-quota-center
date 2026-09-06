@@ -415,32 +415,65 @@ def format_countdown_pair(cd_5h, cd_w):
     s_w = cd_w or f"{C_DIM}--{C_RESET}"
     return f"{pad_visual(s_5h, 6, align='right')} / {pad_visual(s_w, 6, align='right')}"
 
+def score_single_model(frac_5h, frac_w, w_reset_iso=None):
+    f5 = frac_5h if frac_5h is not None else 0.0
+    fw = frac_w if frac_w is not None else 0.0
+    if f5 <= 0.001 and fw <= 0.001:
+        return 0.0, "已耗尽"
+
+    base = f5 * 0.45 + fw * 0.55
+
+    if fw < 0.15:
+        w_mult, w_status = 0.15, "周额告急"
+    elif fw < 0.25:
+        w_mult, w_status = 0.45, "周额偏低"
+    elif fw < 0.50:
+        w_mult, w_status = 0.85, "周额正常"
+    else:
+        w_mult, w_status = 1.0, "周额充足"
+
+    if f5 < 0.05:
+        h5_mult, h5_status = 0.05, "5h触底"
+    elif f5 < 0.20:
+        h5_mult, h5_status = 0.70, "5h偏紧"
+    else:
+        h5_mult, h5_status = 1.0, "5h充沛"
+
+    urgency_mult = 1.0
+    is_urgent = False
+    if fw >= 0.20 and w_reset_iso:
+        try:
+            dt = datetime.fromisoformat(w_reset_iso.replace('Z', '+00:00'))
+            diff_sec = (dt - datetime.now(timezone.utc)).total_seconds()
+            if 0 < diff_sec < 18 * 3600:
+                urgency_mult = 1.15
+                is_urgent = True
+        except Exception:
+            pass
+
+    score = base * w_mult * h5_mult * urgency_mult
+    desc = "即将重置" if is_urgent else (h5_status if f5 < 0.05 else w_status)
+    return score, desc
+
 def calculate_effective_quota(parsed):
     """
-    Evaluates account redundancy using bottleneck principle: min(5h, weekly).
-    Combines Claude and Gemini capacity.
+    Evaluates account redundancy using dual-horizon scoring:
+    45% 5h burst capacity + 55% weekly sustainability with damping and reset urgency.
     """
     if not parsed:
         return -1.0
     c_5h = parsed.get('claude_5h')
     c_w = parsed.get('claude_weekly')
+    c_w_reset = parsed.get('claude_weekly_reset')
+
     g_5h = parsed.get('gemini_5h')
     g_w = parsed.get('gemini_weekly')
+    g_w_reset = parsed.get('gemini_weekly_reset')
 
-    claude_eff = 1.0
-    if c_5h is not None and c_w is not None:
-        claude_eff = min(c_5h, c_w)
-    elif c_w is not None:
-        claude_eff = c_w
+    g_score, _ = score_single_model(g_5h, g_w, g_w_reset)
+    c_score, _ = score_single_model(c_5h, c_w, c_w_reset)
 
-    gemini_eff = 1.0
-    if g_5h is not None and g_w is not None:
-        gemini_eff = min(g_5h, g_w)
-    elif g_w is not None:
-        gemini_eff = g_w
-
-    # Claude quota is weighted higher due to higher scarcity
-    return (claude_eff * 0.6) + (gemini_eff * 0.4)
+    return (g_score * 0.45 + c_score * 0.55) * 100.0
 
 def switch_to_account(account_id_or_keyword):
     """
