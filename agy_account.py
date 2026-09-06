@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from agy_manager import (
     list_all_accounts, fetch_account_quota, parse_quota_buckets,
     calculate_effective_quota, switch_to_account, save_current_agy_to_pool,
-    remove_account, pad_visual, format_compact_countdown,
+    remove_account, pad_visual, format_compact_countdown, format_countdown_pair,
     C_RESET, C_BOLD, C_DIM, C_GREEN, C_YELLOW, C_RED, C_CYAN, C_MAGENTA, C_WHITE
 )
 
@@ -27,9 +27,9 @@ def format_pct_cell(val):
         return f"{C_RED}{pct:4.0f}%{C_RESET}"
 
 def list_accounts_dashboard():
-    print(f"\n{C_BOLD}{C_CYAN}=============================================================================================={C_RESET}")
+    print(f"\n{C_BOLD}{C_CYAN}====================================================================================================={C_RESET}")
     print(f"{C_BOLD} >>> Antigravity 多账号全局额度总览大盘 (AGY Account Pool Monitor) <<<{C_RESET}")
-    print(f"{C_BOLD}{C_CYAN}=============================================================================================={C_RESET}")
+    print(f"{C_BOLD}{C_CYAN}====================================================================================================={C_RESET}")
     print(f"{C_DIM}正在并发同步各账号最新配额状态...{C_RESET}\n")
 
     accounts, current_id = list_all_accounts()
@@ -40,13 +40,12 @@ def list_accounts_dashboard():
     def worker(acc):
         summary, err = fetch_account_quota(acc)
         parsed = parse_quota_buckets(summary) if summary else None
-        eff = calculate_effective_quota(parsed)
-        return acc, summary, err, parsed, eff
+        eff = calculate_effective_quota(parsed) if parsed else 0.0
+        return (acc, summary, err, parsed, eff)
 
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        results = list(executor.map(worker, accounts))
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        results = list(pool.map(worker, accounts))
 
-    # Find best candidate
     best_acc = None
     best_score = -1.0
     for acc, summary, err, parsed, eff in results:
@@ -58,15 +57,18 @@ def list_accounts_dashboard():
             best_score = eff
             best_acc = acc
 
-    header = f" {pad_visual('#', 4)} {pad_visual('状态', 8)} {pad_visual('邮箱账号', 24)} {pad_visual('Gemini (5h/周)', 15)} {pad_visual('G-5h刷新', 10)} {pad_visual('Claude (5h/周)', 15)} {pad_visual('C-5h刷新', 10)}"
+    header = f" {pad_visual('#', 4)} {pad_visual('状态', 8)} {pad_visual('邮箱账号', 24)} {pad_visual('Gemini (5h/周)', 15)} {pad_visual('G刷新(5h/周)', 16)} {pad_visual('Claude (5h/周)', 15)} {pad_visual('C刷新(5h/周)', 16)}"
     print(header)
-    print(f"{'-' * 94}")
+    print(f"{'-' * 105}")
 
     normal_count = 0
     forbidden_count = 0
-    nearest_reset_email = None
-    nearest_reset_sec = float('inf')
-    nearest_reset_info = ""
+    nearest_5h_email = None
+    nearest_5h_sec = float('inf')
+    nearest_5h_info = ""
+    nearest_w_email = None
+    nearest_w_sec = float('inf')
+    nearest_w_info = ""
 
     from datetime import datetime, timezone
     import re
@@ -106,10 +108,16 @@ def list_accounts_dashboard():
             c_w = format_pct_cell(parsed.get('claude_weekly'))
             g_str = f"{g_5h} / {g_w}"
             c_str = f"{c_5h} / {c_w}"
-            g_cd = format_compact_countdown(parsed.get('gemini_5h_reset'), parsed.get('gemini_5h'))
-            c_cd = format_compact_countdown(parsed.get('claude_5h_reset'), parsed.get('claude_5h'))
+            g_cd = format_countdown_pair(
+                format_compact_countdown(parsed.get('gemini_5h_reset'), parsed.get('gemini_5h')),
+                format_compact_countdown(parsed.get('gemini_weekly_reset'), parsed.get('gemini_weekly'))
+            )
+            c_cd = format_countdown_pair(
+                format_compact_countdown(parsed.get('claude_5h_reset'), parsed.get('claude_5h')),
+                format_compact_countdown(parsed.get('claude_weekly_reset'), parsed.get('claude_weekly'))
+            )
 
-            # Check nearest upcoming reset among depleted accounts
+            # Check nearest upcoming 5h reset
             for (rt, frac, m_type) in [(parsed.get('gemini_5h_reset'), parsed.get('gemini_5h'), 'Gemini 5h'),
                                        (parsed.get('claude_5h_reset'), parsed.get('claude_5h'), 'Claude 5h')]:
                 if rt and frac is not None and frac < 0.999:
@@ -117,27 +125,44 @@ def list_accounts_dashboard():
                         clean_iso = re.sub(r'\.\d+', '', rt).replace('Z', '+00:00')
                         t_dt = datetime.fromisoformat(clean_iso)
                         diff_sec = (t_dt - datetime.now(timezone.utc)).total_seconds()
-                        if 0 < diff_sec < nearest_reset_sec:
-                            nearest_reset_sec = diff_sec
-                            nearest_reset_email = email
-                            nearest_reset_info = f"{m_type} 将于 {format_compact_countdown(rt, frac)} 恢复"
+                        if 0 < diff_sec < nearest_5h_sec:
+                            nearest_5h_sec = diff_sec
+                            nearest_5h_email = email
+                            nearest_5h_info = f"{m_type} 将于 {format_compact_countdown(rt, frac, with_suffix=True)} 恢复"
+                    except Exception:
+                        pass
+
+            # Check nearest upcoming weekly reset
+            for (rt, frac, m_type) in [(parsed.get('gemini_weekly_reset'), parsed.get('gemini_weekly'), 'Gemini 周额度'),
+                                       (parsed.get('claude_weekly_reset'), parsed.get('claude_weekly'), 'Claude 周额度')]:
+                if rt and frac is not None and frac < 0.999:
+                    try:
+                        clean_iso = re.sub(r'\.\d+', '', rt).replace('Z', '+00:00')
+                        t_dt = datetime.fromisoformat(clean_iso)
+                        diff_sec = (t_dt - datetime.now(timezone.utc)).total_seconds()
+                        if 0 < diff_sec < nearest_w_sec:
+                            nearest_w_sec = diff_sec
+                            nearest_w_email = email
+                            nearest_w_info = f"{m_type} 将于 {format_compact_countdown(rt, frac, with_suffix=True)} 恢复"
                     except Exception:
                         pass
         else:
             g_str = f"{C_DIM} --  /  -- {C_RESET}"
             c_str = f"{C_DIM} --  /  -- {C_RESET}"
-            g_cd = f"{C_DIM}--{C_RESET}"
-            c_cd = f"{C_DIM}--{C_RESET}"
+            g_cd = f"{C_DIM}    -- /     --{C_RESET}"
+            c_cd = f"{C_DIM}    -- /     --{C_RESET}"
 
-        row = f" {pad_visual(f'[{idx}]', 4)} {pad_visual(status, 8)} {pad_visual(email_str, 24)} {pad_visual(g_str, 15)} {pad_visual(g_cd, 10)} {pad_visual(c_str, 15)} {pad_visual(c_cd, 10)}"
+        row = f" {pad_visual(f'[{idx}]', 4)} {pad_visual(status, 8)} {pad_visual(email_str, 24)} {pad_visual(g_str, 15)} {pad_visual(g_cd, 16)} {pad_visual(c_str, 15)} {pad_visual(c_cd, 16)}"
         print(row)
 
-    print(f"{'-' * 94}")
+    print(f"{'-' * 105}")
     print(f"[统计] 账号池: 共 {len(results)} 个账号 | 正常可用: {normal_count} | 需授权/受限: {forbidden_count}")
-    if nearest_reset_email:
-        print(f"[*] 最近刷新: {C_BOLD}{C_CYAN}{nearest_reset_email}{C_RESET} 的 {C_BOLD}{C_YELLOW}{nearest_reset_info}{C_RESET}！")
+    if nearest_5h_email:
+        print(f"  [*] 最近5h刷新: {C_BOLD}{C_CYAN}{nearest_5h_email}{C_RESET} 的 {C_BOLD}{C_YELLOW}{nearest_5h_info}{C_RESET}！")
+    if nearest_w_email:
+        print(f"  [*] 最近周刷新: {C_BOLD}{C_CYAN}{nearest_w_email}{C_RESET} 的 {C_BOLD}{C_YELLOW}{nearest_w_info}{C_RESET}！")
     if best_acc:
-        print(f"[*] 智能推荐: 可用额度最充沛账号为 {C_BOLD}{C_MAGENTA}{best_acc['email']}{C_RESET}，运行 `agy-switch auto` 一键切换！")
+        print(f"  [*] 智能推荐: 可用额度最充沛账号为 {C_BOLD}{C_MAGENTA}{best_acc['email']}{C_RESET}，运行 `agy-switch auto` 一键切换！")
     print(f"{C_DIM}[说明]: 生图功能 (Imagen 3 / gemini-3.1-flash-image) 共享 Gemini 5h/周配额，查看 Gemini 额度即代表生图额度。{C_RESET}")
     print(f"{C_DIM}[提示]: 输入 `agy-switch <序号>` 即可快速切换当前活动账号。{C_RESET}\n")
 

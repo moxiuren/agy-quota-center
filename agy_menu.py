@@ -46,6 +46,7 @@ from agy_manager import (
     list_all_accounts, fetch_account_quota, parse_quota_buckets,
     calculate_effective_quota, switch_to_account, save_current_agy_to_pool,
     remove_account, refresh_oauth_token, pad_visual, format_compact_countdown,
+    format_countdown_pair,
     save_account, load_account_index, save_account_index,
     OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, USER_AGENT,
     C_RESET, C_BOLD, C_DIM, C_GREEN, C_YELLOW, C_RED, C_CYAN, C_BLUE, C_MAGENTA, C_WHITE
@@ -130,9 +131,9 @@ def option_switch_account():
         pause()
         return
 
-    header = f" {pad_visual('#', 4)} {pad_visual('状态', 8)} {pad_visual('邮箱账号', 24)} {pad_visual('Gemini (5h/周)', 15)} {pad_visual('G-5h刷新', 10)} {pad_visual('Claude (5h/周)', 15)} {pad_visual('C-5h刷新', 10)}"
+    header = f" {pad_visual('#', 4)} {pad_visual('状态', 8)} {pad_visual('邮箱账号', 24)} {pad_visual('Gemini (5h/周)', 15)} {pad_visual('G刷新(5h/周)', 16)} {pad_visual('Claude (5h/周)', 15)} {pad_visual('C刷新(5h/周)', 16)}"
     print(header)
-    print(f"{'-' * 94}")
+    print(f"{'-' * 105}")
 
     def fmt_pct(val):
         if val is None: return f"{C_DIM} -- {C_RESET}"
@@ -167,18 +168,24 @@ def option_switch_account():
         if parsed:
             g_str = f"{fmt_pct(parsed.get('gemini_5h'))} / {fmt_pct(parsed.get('gemini_weekly'))}"
             c_str = f"{fmt_pct(parsed.get('claude_5h'))} / {fmt_pct(parsed.get('claude_weekly'))}"
-            g_cd = format_compact_countdown(parsed.get('gemini_5h_reset'), parsed.get('gemini_5h'))
-            c_cd = format_compact_countdown(parsed.get('claude_5h_reset'), parsed.get('claude_5h'))
+            g_cd = format_countdown_pair(
+                format_compact_countdown(parsed.get('gemini_5h_reset'), parsed.get('gemini_5h')),
+                format_compact_countdown(parsed.get('gemini_weekly_reset'), parsed.get('gemini_weekly'))
+            )
+            c_cd = format_countdown_pair(
+                format_compact_countdown(parsed.get('claude_5h_reset'), parsed.get('claude_5h')),
+                format_compact_countdown(parsed.get('claude_weekly_reset'), parsed.get('claude_weekly'))
+            )
         else:
             g_str = f"{C_DIM} --  /  -- {C_RESET}"
             c_str = f"{C_DIM} --  /  -- {C_RESET}"
-            g_cd = f"{C_DIM}--{C_RESET}"
-            c_cd = f"{C_DIM}--{C_RESET}"
+            g_cd = f"{C_DIM}    -- /     --{C_RESET}"
+            c_cd = f"{C_DIM}    -- /     --{C_RESET}"
 
-        row = f" {pad_visual(f'[{idx}]', 4)} {pad_visual(status, 8)} {pad_visual(email_str, 24)} {pad_visual(g_str, 15)} {pad_visual(g_cd, 10)} {pad_visual(c_str, 15)} {pad_visual(c_cd, 10)}"
+        row = f" {pad_visual(f'[{idx}]', 4)} {pad_visual(status, 8)} {pad_visual(email_str, 24)} {pad_visual(g_str, 15)} {pad_visual(g_cd, 16)} {pad_visual(c_str, 15)} {pad_visual(c_cd, 16)}"
         print(row)
 
-    print(f"{'-' * 94}")
+    print(f"{'-' * 105}")
     if best_acc:
         print(f"提示: 输入 {C_BOLD}{C_MAGENTA}'auto'{C_RESET} 自动切至最高额度账号: {C_BOLD}{best_acc['email']}{C_RESET}")
 

@@ -340,7 +340,8 @@ def fetch_account_quota(account):
 def parse_quota_buckets(summary):
     """Extracts remaining fractions and reset times for Gemini 5h, Gemini Weekly, Claude 5h, Claude Weekly."""
     gemini_5h, gemini_w, claude_5h, claude_w = None, None, None, None
-    gemini_5h_reset, claude_5h_reset = None, None
+    gemini_5h_reset, gemini_w_reset = None, None
+    claude_5h_reset, claude_w_reset = None, None
     if not summary:
         return None
 
@@ -357,25 +358,29 @@ def parse_quota_buckets(summary):
                     claude_5h_reset = rt
                 elif win == 'weekly':
                     claude_w = frac
+                    claude_w_reset = rt
             else:
                 if win == '5h':
                     gemini_5h = frac
                     gemini_5h_reset = rt
                 elif win == 'weekly':
                     gemini_w = frac
+                    gemini_w_reset = rt
 
     return {
         'gemini_5h': gemini_5h,
         'gemini_weekly': gemini_w,
         'gemini_5h_reset': gemini_5h_reset,
+        'gemini_weekly_reset': gemini_w_reset,
         'claude_5h': claude_5h,
         'claude_weekly': claude_w,
-        'claude_5h_reset': claude_5h_reset
+        'claude_5h_reset': claude_5h_reset,
+        'claude_weekly_reset': claude_w_reset
     }
 
 from datetime import datetime, timezone
 
-def format_compact_countdown(target_iso, frac=1.0):
+def format_compact_countdown(target_iso, frac=1.0, with_suffix=False):
     if frac is not None and frac >= 0.999:
         return f"{C_GREEN}满额{C_RESET}"
     if not target_iso:
@@ -390,15 +395,25 @@ def format_compact_countdown(target_iso, frac=1.0):
             return f"{C_GREEN}已就绪{C_RESET}"
         hours = total_sec // 3600
         mins = (total_sec % 3600) // 60
-        if hours > 24:
+        suf = "后" if with_suffix else ""
+        if hours >= 24:
             days = hours // 24
-            return f"{C_YELLOW}{days}天{hours%24}h后{C_RESET}"
+            rem_h = hours % 24
+            if rem_h > 0:
+                return f"{C_YELLOW}{days}天{rem_h:02d}h{suf}{C_RESET}"
+            else:
+                return f"{C_YELLOW}{days}天{suf}{C_RESET}"
         elif hours > 0:
-            return f"{C_YELLOW}{hours}h{mins:02d}m后{C_RESET}"
+            return f"{C_YELLOW}{hours}h{mins:02d}m{suf}{C_RESET}"
         else:
-            return f"{C_MAGENTA}{mins}分后{C_RESET}"
+            return f"{C_MAGENTA}{mins}分{suf}{C_RESET}"
     except Exception:
         return f"{C_DIM}--{C_RESET}"
+
+def format_countdown_pair(cd_5h, cd_w):
+    s_5h = cd_5h or f"{C_DIM}--{C_RESET}"
+    s_w = cd_w or f"{C_DIM}--{C_RESET}"
+    return f"{pad_visual(s_5h, 6, align='right')} / {pad_visual(s_w, 6, align='right')}"
 
 def calculate_effective_quota(parsed):
     """

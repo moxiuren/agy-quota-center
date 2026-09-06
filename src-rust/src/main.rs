@@ -549,6 +549,15 @@ fn pad_visual(s: &str, target_width: usize) -> String {
     }
 }
 
+fn pad_visual_right(s: &str, target_width: usize) -> String {
+    let w = visible_width(s);
+    if w >= target_width {
+        s.to_string()
+    } else {
+        format!("{}{}", " ".repeat(target_width - w), s)
+    }
+}
+
 fn make_bar(fraction: f64, width: usize) -> String {
     let f = fraction.clamp(0.0, 1.0);
     let filled = (f * width as f64).round() as usize;
@@ -839,10 +848,14 @@ struct ParsedQuota {
     gemini_weekly: Option<f64>,
     gemini_5h_reset: Option<String>,
     gemini_5h_countdown: Option<String>,
+    gemini_weekly_reset: Option<String>,
+    gemini_weekly_countdown: Option<String>,
     claude_5h: Option<f64>,
     claude_weekly: Option<f64>,
     claude_5h_reset: Option<String>,
     claude_5h_countdown: Option<String>,
+    claude_weekly_reset: Option<String>,
+    claude_weekly_countdown: Option<String>,
     effective_score: f64,
 }
 
@@ -864,16 +877,28 @@ fn format_compact_countdown(target_iso: Option<&str>, frac: Option<f64>) -> Stri
         }
         let hours = diff / 3600;
         let mins = (diff % 3600) / 60;
-        if hours > 24 {
-            format!("{}天{}h后", hours / 24, hours % 24)
+        if hours >= 24 {
+            let days = hours / 24;
+            let rem_h = hours % 24;
+            if rem_h > 0 {
+                format!("{}天{:02}h", days, rem_h)
+            } else {
+                format!("{}天", days)
+            }
         } else if hours > 0 {
-            format!("{}h{:02}m后", hours, mins)
+            format!("{}h{:02}m", hours, mins)
         } else {
-            format!("{}分后", mins)
+            format!("{}分", mins)
         }
     } else {
         "--".to_string()
     }
+}
+
+fn format_countdown_pair(cd_5h: Option<&str>, cd_w: Option<&str>) -> String {
+    let s_5h = cd_5h.unwrap_or("--");
+    let s_w = cd_w.unwrap_or("--");
+    format!("{} / {}", pad_visual_right(s_5h, 6), pad_visual_right(s_w, 6))
 }
 
 fn format_relative_time(iso_str: &str) -> (String, String) {
@@ -923,6 +948,7 @@ fn parse_quota_buckets(summary: &Value) -> ParsedQuota {
                             q.claude_5h_reset = rt;
                         } else if win == "weekly" {
                             q.claude_weekly = frac;
+                            q.claude_weekly_reset = rt;
                         }
                     } else {
                         if win == "5h" {
@@ -930,6 +956,7 @@ fn parse_quota_buckets(summary: &Value) -> ParsedQuota {
                             q.gemini_5h_reset = rt;
                         } else if win == "weekly" {
                             q.gemini_weekly = frac;
+                            q.gemini_weekly_reset = rt;
                         }
                     }
                 }
@@ -938,7 +965,9 @@ fn parse_quota_buckets(summary: &Value) -> ParsedQuota {
     }
 
     q.gemini_5h_countdown = Some(format_compact_countdown(q.gemini_5h_reset.as_deref(), q.gemini_5h));
+    q.gemini_weekly_countdown = Some(format_compact_countdown(q.gemini_weekly_reset.as_deref(), q.gemini_weekly));
     q.claude_5h_countdown = Some(format_compact_countdown(q.claude_5h_reset.as_deref(), q.claude_5h));
+    q.claude_weekly_countdown = Some(format_compact_countdown(q.claude_weekly_reset.as_deref(), q.claude_weekly));
 
     let g_eff = q.gemini_5h.unwrap_or(0.0).min(q.gemini_weekly.unwrap_or(0.0));
     let c_eff = q.claude_5h.unwrap_or(0.0).min(q.claude_weekly.unwrap_or(0.0));
@@ -1152,6 +1181,8 @@ fn option_view_current_quota() {
                     let bar = make_bar(frac, 22);
                     let reset_hint = if frac < 0.999 && !rt.is_empty() {
                         format!(" {}(刷新: {} | 本地: {}){}", C_DIM, countdown, local_time, C_RESET)
+                    } else if !rt.is_empty() {
+                        format!(" {}(满额 | 周期重置: {} | 本地: {}){}", C_DIM, countdown, local_time, C_RESET)
                     } else {
                         String::new()
                     };
@@ -1240,14 +1271,14 @@ fn print_accounts_table(rows: &[AccountRow], current_id: Option<&str>, best_acc:
         " {} {} {} {} {} {} {}",
         pad_visual("#", 4),
         pad_visual("状态", 8),
-        pad_visual("邮箱账号", 26),
+        pad_visual("邮箱账号", 24),
         pad_visual("Gemini (5h/周)", 15),
-        pad_visual("G-5h刷新", 10),
+        pad_visual("G刷新(5h/周)", 16),
         pad_visual("Claude (5h/周)", 15),
-        pad_visual("C-5h刷新", 10)
+        pad_visual("C刷新(5h/周)", 16)
     );
     println!("{}", header);
-    println!("{}", "-".repeat(98));
+    println!("{}", "-".repeat(105));
 
     let fmt_pct = |val: Option<f64>| -> String {
         match val {
@@ -1261,7 +1292,7 @@ fn print_accounts_table(rows: &[AccountRow], current_id: Option<&str>, best_acc:
                     format!("{}{:4.0}%{}", C_RED, pct, C_RESET)
                 }
             }
-            None => format!("{} -- {}", C_DIM, C_RESET),
+            None => format!("{}  -- {}", C_DIM, C_RESET),
         }
     };
 
@@ -1294,16 +1325,16 @@ fn print_accounts_table(rows: &[AccountRow], current_id: Option<&str>, best_acc:
         let (g_str, g_cd, c_str, c_cd) = if let Some(p) = &r.parsed {
             (
                 format!("{} / {}", fmt_pct(p.gemini_5h), fmt_pct(p.gemini_weekly)),
-                p.gemini_5h_countdown.clone().unwrap_or_else(|| "--".to_string()),
+                format_countdown_pair(p.gemini_5h_countdown.as_deref(), p.gemini_weekly_countdown.as_deref()),
                 format!("{} / {}", fmt_pct(p.claude_5h), fmt_pct(p.claude_weekly)),
-                p.claude_5h_countdown.clone().unwrap_or_else(|| "--".to_string()),
+                format_countdown_pair(p.claude_5h_countdown.as_deref(), p.claude_weekly_countdown.as_deref()),
             )
         } else {
             (
-                format!("{} --  /  -- {}", C_DIM, C_RESET),
-                format!("{}--{}", C_DIM, C_RESET),
-                format!("{} --  /  -- {}", C_DIM, C_RESET),
-                format!("{}--{}", C_DIM, C_RESET),
+                format!("{}  --  /  --  {}", C_DIM, C_RESET),
+                format!("{}    -- /     --{}", C_DIM, C_RESET),
+                format!("{}  --  /  --  {}", C_DIM, C_RESET),
+                format!("{}    -- /     --{}", C_DIM, C_RESET),
             )
         };
 
@@ -1311,15 +1342,82 @@ fn print_accounts_table(rows: &[AccountRow], current_id: Option<&str>, best_acc:
             " {} {} {} {} {} {} {}",
             pad_visual(&format!("[{}]", idx), 4),
             pad_visual(&status, 8),
-            pad_visual(&email_str, 26),
+            pad_visual(&email_str, 24),
             pad_visual(&g_str, 15),
-            pad_visual(&g_cd, 10),
+            pad_visual(&g_cd, 16),
             pad_visual(&c_str, 15),
-            pad_visual(&c_cd, 10)
+            pad_visual(&c_cd, 16)
         );
         println!("{}", row);
     }
-    println!("{}", "-".repeat(98));
+    println!("{}", "-".repeat(105));
+
+    let normal_count = rows.iter().filter(|r| r.err.is_none()).count();
+    let err_count = rows.len().saturating_sub(normal_count);
+
+    let mut nearest_5h_email: Option<&str> = None;
+    let mut nearest_5h_sec = i64::MAX;
+    let mut nearest_5h_desc = String::new();
+
+    let mut nearest_w_email: Option<&str> = None;
+    let mut nearest_w_sec = i64::MAX;
+    let mut nearest_w_desc = String::new();
+
+    let now = Utc::now();
+
+    for r in rows {
+        if let Some(p) = &r.parsed {
+            for (rt_opt, frac_opt, m_type) in [
+                (p.gemini_5h_reset.as_deref(), p.gemini_5h, "Gemini 5h"),
+                (p.claude_5h_reset.as_deref(), p.claude_5h, "Claude 5h"),
+            ] {
+                if let (Some(rt), Some(frac)) = (rt_opt, frac_opt) {
+                    if frac < 0.999 && !rt.is_empty() {
+                        if let Ok(dt) = DateTime::parse_from_rfc3339(rt) {
+                            let diff = dt.signed_duration_since(now).num_seconds();
+                            if diff > 0 && diff < nearest_5h_sec {
+                                nearest_5h_sec = diff;
+                                nearest_5h_email = Some(&r.acc.email);
+                                let (cd, loc) = format_relative_time(rt);
+                                nearest_5h_desc = format!("{} 将于 {} ({}) 恢复", m_type, cd, loc);
+                            }
+                        }
+                    }
+                }
+            }
+
+            for (rt_opt, frac_opt, m_type) in [
+                (p.gemini_weekly_reset.as_deref(), p.gemini_weekly, "Gemini 周额度"),
+                (p.claude_weekly_reset.as_deref(), p.claude_weekly, "Claude 周额度"),
+            ] {
+                if let (Some(rt), Some(frac)) = (rt_opt, frac_opt) {
+                    if frac < 0.999 && !rt.is_empty() {
+                        if let Ok(dt) = DateTime::parse_from_rfc3339(rt) {
+                            let diff = dt.signed_duration_since(now).num_seconds();
+                            if diff > 0 && diff < nearest_w_sec {
+                                nearest_w_sec = diff;
+                                nearest_w_email = Some(&r.acc.email);
+                                let (cd, loc) = format_relative_time(rt);
+                                nearest_w_desc = format!("{} 将于 {} ({}) 恢复", m_type, cd, loc);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    println!("{}[统计] 账号池: 共 {} 个账号 | 正常可用: {} | 需授权/受限: {}{}", C_DIM, rows.len(), normal_count, err_count, C_RESET);
+    if let Some(email) = nearest_5h_email {
+        println!("  [*] 最近5h刷新: {}{}{}{} 的 {}{}{}", C_CYAN, C_BOLD, email, C_RESET, C_YELLOW, nearest_5h_desc, C_RESET);
+    }
+    if let Some(email) = nearest_w_email {
+        println!("  [*] 最近周刷新: {}{}{}{} 的 {}{}{}", C_BLUE, C_BOLD, email, C_RESET, C_YELLOW, nearest_w_desc, C_RESET);
+    }
+    if let Some(best) = best_acc {
+        println!("  [*] 智能推荐: 可用额度最充沛账号为 {}{}{}{}{}，输入 {}'auto'{} 可一键秒切！", C_MAGENTA, C_BOLD, C_WHITE, best.email, C_RESET, C_BOLD, C_RESET);
+    }
+    println!("{}[说明]: 生图功能 (Imagen 3 / gemini-3.1-flash-image) 共享 Gemini 5h/周配额。{}", C_DIM, C_RESET);
 }
 
 fn option_view_all_accounts() {
