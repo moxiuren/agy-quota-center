@@ -577,7 +577,78 @@ def switch_to_account(account_id_or_keyword):
     target_account['last_used'] = int(datetime.now().timestamp())
     save_account(target_account)
 
+    # 智能模型联动调配
+    try:
+        valid_tok = ensure_valid_token(target_account)
+        summary = fetch_quota_summary(valid_tok)
+        if summary:
+            parsed = parse_quota_buckets(summary)
+            best_m, reason = evaluate_best_model_for_quota(parsed)
+            cur_m = get_active_model_setting()
+            if best_m != cur_m:
+                set_active_model_setting(best_m)
+                print(f"{C_BOLD}{C_GREEN}[+] 智能模型联动: 检测到 {reason}，已自动适配模型为: {best_m}{C_RESET}")
+    except Exception:
+        pass
+
     return True, email
+
+MODEL_CLAUDE_SONNET = "Claude Sonnet 4.6 (Thinking)"
+MODEL_CLAUDE_OPUS = "Claude Opus 4.6 (Thinking)"
+MODEL_GEMINI_FLASH = "Gemini 3.8 Flash (High)"
+MODEL_GEMINI_PRO = "Gemini 3.1 Pro (High)"
+
+def get_cli_settings_path():
+    home = os.path.expanduser("~")
+    return os.path.join(home, ".gemini", "antigravity-cli", "settings.json")
+
+def get_active_model_setting():
+    path = get_cli_settings_path()
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if "model" in data and data["model"]:
+                    return data["model"]
+        except Exception:
+            pass
+    return MODEL_GEMINI_FLASH
+
+def set_active_model_setting(model_name):
+    path = get_cli_settings_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    data = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+    data["model"] = model_name
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    return True
+
+def evaluate_best_model_for_quota(parsed):
+    c5 = parsed.get("claude_5h") or 0.0
+    cw = parsed.get("claude_weekly") or 0.0
+    g5 = parsed.get("gemini_5h") or 0.0
+    gw = parsed.get("gemini_weekly") or 0.0
+
+    claude_healthy = (c5 >= 0.25 and cw >= 0.15)
+    claude_superior = (c5 >= 0.20 and cw >= 0.10 and c5 >= g5)
+
+    if claude_healthy or claude_superior:
+        reason = f"Claude 额度充沛 (5h: {c5*100:.0f}%, 周: {cw*100:.0f}%)"
+        return MODEL_CLAUDE_SONNET, reason
+    elif g5 >= 0.15 and gw >= 0.10:
+        if c5 < 0.15 or cw < 0.10:
+            reason = f"Claude 额度告急 (5h: {c5*100:.0f}%, 周: {cw*100:.0f}%) -> 自动切至 Gemini 续航 (5h: {g5*100:.0f}%)"
+        else:
+            reason = f"Gemini 额度更充沛 (G-5h: {g5*100:.0f}% > C-5h: {c5*100:.0f}%)"
+        return MODEL_GEMINI_FLASH, reason
+    else:
+        return MODEL_CLAUDE_SONNET, "额度均偏紧，默认保持 Claude Sonnet"
 
 def save_current_agy_to_pool(name=None):
     """Snapshots current active credentials from Windows Keyring into the ~/.antigravity_tools pool."""

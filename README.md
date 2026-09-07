@@ -47,16 +47,16 @@
 ======================================================================
  >>> Antigravity (AGY) 多账号与配额管理中心 v2.3.0 (Rust) <<<
 ======================================================================
- 当前活动账号: dev-primary@gmail.com  |  套餐类型: Antigravity
+ 当前活动账号: dev-primary@gmail.com  |  默认模型: Claude Sonnet 4.6 (Thinking)  |  套餐: Antigravity
  系统本地时间: 2026-09-06 12:30:00
 ----------------------------------------------------------------------
  [1] 查看当前账号额度详情 (Detailed Quota)
  [2] 查看所有账号全局大盘 (All Accounts Overview)
  [3] 切换当前活动账号 (Switch Account - 交互选择 / 序号 / 邮箱)
- [4] 智能切至最高额度账号 (Auto-Switch to Best Quota Account)
+ [4] 智能切至最高额度账号与模型 (Auto-Switch Account & Claude/Gemini Model)
  [A] 后台自动调配守护服务 (Auto-Guard Daemon - 监控/自动切号/通知)
  [P] 一键唤醒全账号池沉睡周额度时钟 (Pre-warm Weekly Clocks - 提前激活7天倒计时)
- [M] 切换全局默认模型 (Switch Default Model: Claude / Gemini)
+ [M] 切换全局默认模型 (Switch Default Model: Claude / Gemini / Auto)
  [5] 保存当前 agy 账号至账号池 (Save Active agy Account)
  [6] 添加新账号到账号池 (Add New Account - 浏览器授权 / Token)
  [7] 从账号池移除账号 (Remove Account)
@@ -72,10 +72,10 @@
 | 操作需求 | 菜单输入 | 功能说明 |
 | :--- | :---: | :--- |
 | **查询所有账号配额** | `2` | 集中展示全部账号的可用百分比与刷新倒计时 |
-| **切至最高额度账号** | `4` | 自动计算综合评分最优账号并切换，协同重载终端 |
-| **启动自动守护服务** | `A` | 开启后台自动监控，配额不足时自动切换并通过系统通知提醒 |
+| **切至最高额度账号与模型** | `4` | 自动计算最优账号；若 Claude 额度充沛联动切至 Claude Sonnet，告急时平滑回退 Gemini |
+| **启动自动守护服务** | `A` | 开启后台自动监控，Claude 充沛自动升档，配额告急时自动切换并通知 |
 | **激活周额度时钟** | `P` | 批量唤醒账号池内尚未启动 7 天倒计时的账号 |
-| **切换全局默认模型** | `M` | 选择 Claude (Sonnet / Opus) 或 Gemini 作为全局默认调用模型 |
+| **切换全局默认模型** | `M` | 选择 Claude (Sonnet / Opus) 或 Gemini，或输入 `5` 依据配额智能自动匹配 |
 | **导入新 Google 账号** | `6` | 支持浏览器授权或粘贴 Refresh Token 录入账号池 |
 
 ---
@@ -88,10 +88,13 @@
 # 查看所有账号配额概览
 AGY_Quota_Center_v2.3.0.exe usage
 
-# 自动切至最优额度账号并重载终端
+# 自动切至最优额度账号，Claude充沛时联动切至Claude Sonnet并重载终端
 AGY_Quota_Center_v2.3.0.exe auto
 
-# 后台静默启动守护服务 (无控制台窗口)
+# 智能分析当前配额自动匹配最佳模型 (Claude Sonnet / Gemini Flash)
+AGY_Quota_Center_v2.3.0.exe model auto
+
+# 后台静默启动守护服务 (无控制台窗口，持续监控/模型升级/告急切换)
 AGY_Quota_Center_v2.3.0.exe guard --bg
 
 # 查询守护服务运行状态
