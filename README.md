@@ -47,16 +47,16 @@
 ======================================================================
  >>> Antigravity (AGY) 多账号与配额管理中心 v2.3.0 (Rust) <<<
 ======================================================================
- 当前活动账号: dev-primary@gmail.com  |  默认模型: Claude Sonnet 4.6 (Thinking)  |  套餐: Antigravity
+ 当前活动账号: dev-primary@gmail.com  |  默认模型: Gemini 3.8 Flash (High)  |  套餐: Antigravity
  系统本地时间: 2026-09-06 12:30:00
 ----------------------------------------------------------------------
  [1] 查看当前账号额度详情 (Detailed Quota)
  [2] 查看所有账号全局大盘 (All Accounts Overview)
  [3] 切换当前活动账号 (Switch Account - 交互选择 / 序号 / 邮箱)
- [4] 智能切至最高额度账号与模型 (Auto-Switch Account & Claude/Gemini Model)
+ [4] 智能切至当前模型最高额度账号 (Auto-Switch within Active Model Quota Pool)
  [A] 后台自动调配守护服务 (Auto-Guard Daemon - 监控/自动切号/通知)
  [P] 一键唤醒全账号池沉睡周额度时钟 (Pre-warm Weekly Clocks - 提前激活7天倒计时)
- [M] 切换全局默认模型 (Switch Default Model: Claude / Gemini / Auto)
+ [M] 切换全局默认模型 (Switch Default Model: Claude / Opus / Flash / Pro)
  [5] 保存当前 agy 账号至账号池 (Save Active agy Account)
  [6] 添加新账号到账号池 (Add New Account - 浏览器授权 / Token)
  [7] 从账号池移除账号 (Remove Account)
@@ -72,10 +72,10 @@
 | 操作需求 | 菜单输入 | 功能说明 |
 | :--- | :---: | :--- |
 | **查询所有账号配额** | `2` | 集中展示全部账号的可用百分比与刷新倒计时 |
-| **切至最高额度账号与模型** | `4` | 自动计算最优账号；若 Claude 额度充沛联动切至 Claude Sonnet，告急时平滑回退 Gemini |
-| **启动自动守护服务** | `A` | 开启后台自动监控，Claude 充沛自动升档，配额告急时自动切换并通知 |
+| **切至当前模型最优账号** | `4` | 当前设为何种默认模型，即在该模型额度池内优选最高可用账号，模型严格保持锁定不变 |
+| **启动自动守护服务** | `A` | 开启后台自动监控，当活动账号在当前模型下的额度告急时自动切换至同模型最优账号并通知 |
 | **激活周额度时钟** | `P` | 批量唤醒账号池内尚未启动 7 天倒计时的账号 |
-| **切换全局默认模型** | `M` | 选择 Claude (Sonnet / Opus) 或 Gemini，或输入 `5` 依据配额智能自动匹配 |
+| **切换全局默认模型** | `M` | 交互切换全局默认模型：Claude Sonnet、Claude Opus、Gemini 3.8 Flash、Gemini 3.1 Pro |
 | **导入新 Google 账号** | `6` | 支持浏览器授权或粘贴 Refresh Token 录入账号池 |
 
 ---
@@ -88,13 +88,15 @@
 # 查看所有账号配额概览
 AGY_Quota_Center_v2.3.0.exe usage
 
-# 自动切至最优额度账号，Claude充沛时联动切至Claude Sonnet并重载终端
+# 智能分析当前模型下的各账号余量，切至最优账号并热重载终端（模型严格保持不变）
 AGY_Quota_Center_v2.3.0.exe auto
 
-# 智能分析当前配额自动匹配最佳模型 (Claude Sonnet / Gemini Flash)
-AGY_Quota_Center_v2.3.0.exe model auto
+# 切换全局默认模型 (flash / pro / sonnet / opus)
+AGY_Quota_Center_v2.3.0.exe model flash
+AGY_Quota_Center_v2.3.0.exe model opus
+AGY_Quota_Center_v2.3.0.exe model claude
 
-# 后台静默启动守护服务 (无控制台窗口，持续监控/模型升级/告急切换)
+# 后台静默启动守护服务 (无控制台窗口，持续监控当前模型额度并在告急时自动切号)
 AGY_Quota_Center_v2.3.0.exe guard --bg
 
 # 查询守护服务运行状态
@@ -105,10 +107,6 @@ AGY_Quota_Center_v2.3.0.exe guard --stop
 
 # 批量预热沉睡的周配额时钟
 AGY_Quota_Center_v2.3.0.exe prewarm
-
-# 切换全局默认模型 (claude / opus / flash / pro)
-AGY_Quota_Center_v2.3.0.exe model opus
-AGY_Quota_Center_v2.3.0.exe model claude
 ```
 
 ---

@@ -415,65 +415,118 @@ def format_countdown_pair(cd_5h, cd_w):
     s_w = cd_w or f"{C_DIM}--{C_RESET}"
     return f"{pad_visual(s_5h, 6, align='right')} / {pad_visual(s_w, 6, align='right')}"
 
-def score_single_model(frac_5h, frac_w, w_reset_iso=None):
+MODEL_CLAUDE_SONNET = "Claude Sonnet 4.6 (Thinking)"
+MODEL_CLAUDE_OPUS = "Claude Opus 4.6 (Thinking)"
+MODEL_GEMINI_FLASH = "Gemini 3.8 Flash (High)"
+MODEL_GEMINI_PRO = "Gemini 3.1 Pro (High)"
+
+def is_claude_model(model_name):
+    m = (model_name or "").lower()
+    return any(k in m for k in ["claude", "sonnet", "opus", "haiku", "gpt"])
+
+def score_matrix_slot(email, model_name, frac_5h, frac_w, w_reset_iso=None):
     f5 = frac_5h if frac_5h is not None else 0.0
     fw = frac_w if frac_w is not None else 0.0
-    if f5 <= 0.001 and fw <= 0.001:
-        return 0.0, "已耗尽"
+    if frac_5h is None and frac_w is None:
+        return 0.0, False, "未获取到配额"
+
+    is_primary = (email or "").strip().lower() == "moxiuren@gmail.com"
+
+    rem_sec = 7 * 86400
+    if w_reset_iso:
+        try:
+            dt = datetime.fromisoformat(w_reset_iso.replace('Z', '+00:00'))
+            rem_sec = max(0, int((dt - datetime.now(timezone.utc)).total_seconds()))
+        except Exception:
+            pass
+
+    if is_primary:
+        # === moxiuren@gmail.com 弟妹共享双轨安全防护机制 ===
+        # 轨1: 5小时硬性留存防线 (>= 75%)
+        if f5 < 0.75:
+            return 0.0, False, f"[留存保护: 5h余量 {f5*100:.0f}% < 75% 共享硬防线]"
+
+        # 轨2: 每周额度 48h 三阶梯渐进释放
+        if rem_sec > 48 * 3600:
+            if fw <= 0.75:
+                return 0.0, False, f"[留存保护: 常规期周余量 {fw*100:.0f}% <= 75% 防线]"
+            base = f5 * 0.45 + fw * 0.55
+            score = round(base * 0.30 * 100.0, 1)
+            return score, True, f"[主号常规留存 (0.30x): 5h={f5*100:.0f}%, 周={fw*100:.0f}%]"
+        elif rem_sec > 24 * 3600:
+            if fw <= 0.50:
+                return 0.0, False, f"[留存保护: 临期2天周余量 {fw*100:.0f}% <= 50% 防线]"
+            base = f5 * 0.45 + fw * 0.55
+            mult = 0.85 if fw > 0.60 else 0.50
+            score = round(base * mult * 100.0, 1)
+            return score, True, f"[主号临期2天释放 ({mult:.2f}x): 5h={f5*100:.0f}%, 周={fw*100:.0f}%]"
+        else:
+            if fw <= 0.25:
+                return 0.0, False, f"[留存保护: 终期周余量 {fw*100:.0f}% <= 25% 防线]"
+            base = f5 * 0.45 + fw * 0.55
+            mult = 1.20 if fw > 0.35 else 0.80
+            score = round(base * mult * 100.0, 1)
+            return score, True, f"[主号最后24h清仓 ({mult:.2f}x): 5h={f5*100:.0f}%, 周={fw*100:.0f}%]"
+
+    if f5 <= 0.05 and fw <= 0.05:
+        return 0.0, False, "已耗尽"
 
     base = f5 * 0.45 + fw * 0.55
 
     if fw < 0.15:
-        w_mult, w_status = 0.15, "周额告急"
+        w_mult, w_status = 0.20, "周额告急"
     elif fw < 0.25:
-        w_mult, w_status = 0.45, "周额偏低"
+        w_mult, w_status = 0.50, "周额偏低"
     elif fw < 0.50:
         w_mult, w_status = 0.85, "周额正常"
     else:
         w_mult, w_status = 1.0, "周额充足"
 
-    if f5 < 0.05:
-        h5_mult, h5_status = 0.05, "5h触底"
-    elif f5 < 0.20:
-        h5_mult, h5_status = 0.70, "5h偏紧"
+    if f5 < 0.15:
+        h5_mult, h5_status = 0.40, "5h触底"
+    elif f5 < 0.25:
+        h5_mult, h5_status = 0.75, "5h偏紧"
     else:
         h5_mult, h5_status = 1.0, "5h充沛"
 
-    urgency_mult = 1.0
-    is_urgent = False
-    if fw >= 0.20 and w_reset_iso:
-        try:
-            dt = datetime.fromisoformat(w_reset_iso.replace('Z', '+00:00'))
-            diff_sec = (dt - datetime.now(timezone.utc)).total_seconds()
-            if 0 < diff_sec < 18 * 3600:
-                urgency_mult = 1.15
-                is_urgent = True
-        except Exception:
-            pass
+    urgency_mult = 1.15 if (fw >= 0.25 and rem_sec <= 24 * 3600) else 1.0
 
-    score = base * w_mult * h5_mult * urgency_mult
-    desc = "即将重置" if is_urgent else (h5_status if f5 < 0.05 else w_status)
-    return score, desc
+    is_claude = is_claude_model(model_name)
+    tag_prefix = "Claude" if is_claude else "Gemini"
+    pref_mult = 1.0
 
-def calculate_effective_quota(parsed):
-    """
-    Evaluates account redundancy using dual-horizon scoring:
-    45% 5h burst capacity + 55% weekly sustainability with damping and reset urgency.
-    """
+    raw = base * w_mult * h5_mult * urgency_mult * pref_mult * 100.0
+    score = round(raw, 1)
+    is_eligible = (f5 > 0.15 and fw > 0.10)
+
+    if urgency_mult > 1.0:
+        desc = f"[{tag_prefix} 临期重置冲刺]"
+    elif f5 < 0.15:
+        desc = f"[{tag_prefix} {h5_status}]"
+    else:
+        desc = f"[{tag_prefix} {w_status}]"
+
+    return score, is_eligible, desc
+
+def score_single_model(frac_5h, frac_w, w_reset_iso=None):
+    s, _, _ = score_matrix_slot("", MODEL_GEMINI_FLASH, frac_5h, frac_w, w_reset_iso)
+    return s, "模型就绪"
+
+def calculate_effective_quota(parsed, email=None):
     if not parsed:
         return -1.0
-    c_5h = parsed.get('claude_5h')
-    c_w = parsed.get('claude_weekly')
-    c_w_reset = parsed.get('claude_weekly_reset')
+    cur_m = get_active_model_setting()
+    if is_claude_model(cur_m):
+        f5 = parsed.get('claude_5h')
+        fw = parsed.get('claude_weekly')
+        w_reset = parsed.get('claude_weekly_reset')
+    else:
+        f5 = parsed.get('gemini_5h')
+        fw = parsed.get('gemini_weekly')
+        w_reset = parsed.get('gemini_weekly_reset')
 
-    g_5h = parsed.get('gemini_5h')
-    g_w = parsed.get('gemini_weekly')
-    g_w_reset = parsed.get('gemini_weekly_reset')
-
-    g_score, _ = score_single_model(g_5h, g_w, g_w_reset)
-    c_score, _ = score_single_model(c_5h, c_w, c_w_reset)
-
-    return (g_score * 0.45 + c_score * 0.55) * 100.0
+    score, _, _ = score_matrix_slot(email or "", cur_m, f5, fw, w_reset)
+    return score
 
 def switch_to_account(account_id_or_keyword):
     """
@@ -577,26 +630,7 @@ def switch_to_account(account_id_or_keyword):
     target_account['last_used'] = int(datetime.now().timestamp())
     save_account(target_account)
 
-    # 智能模型联动调配
-    try:
-        valid_tok = ensure_valid_token(target_account)
-        summary = fetch_quota_summary(valid_tok)
-        if summary:
-            parsed = parse_quota_buckets(summary)
-            best_m, reason = evaluate_best_model_for_quota(parsed)
-            cur_m = get_active_model_setting()
-            if best_m != cur_m:
-                set_active_model_setting(best_m)
-                print(f"{C_BOLD}{C_GREEN}[+] 智能模型联动: 检测到 {reason}，已自动适配模型为: {best_m}{C_RESET}")
-    except Exception:
-        pass
-
     return True, email
-
-MODEL_CLAUDE_SONNET = "Claude Sonnet 4.6 (Thinking)"
-MODEL_CLAUDE_OPUS = "Claude Opus 4.6 (Thinking)"
-MODEL_GEMINI_FLASH = "Gemini 3.8 Flash (High)"
-MODEL_GEMINI_PRO = "Gemini 3.1 Pro (High)"
 
 def get_cli_settings_path():
     home = os.path.expanduser("~")
@@ -629,26 +663,12 @@ def set_active_model_setting(model_name):
         json.dump(data, f, indent=2, ensure_ascii=False)
     return True
 
+def evaluate_best_model_for_account(email, parsed):
+    cur_m = get_active_model_setting()
+    return cur_m, f"保持当前默认模型: {cur_m}"
+
 def evaluate_best_model_for_quota(parsed):
-    c5 = parsed.get("claude_5h") or 0.0
-    cw = parsed.get("claude_weekly") or 0.0
-    g5 = parsed.get("gemini_5h") or 0.0
-    gw = parsed.get("gemini_weekly") or 0.0
-
-    claude_healthy = (c5 >= 0.25 and cw >= 0.15)
-    claude_superior = (c5 >= 0.20 and cw >= 0.10 and c5 >= g5)
-
-    if claude_healthy or claude_superior:
-        reason = f"Claude 额度充沛 (5h: {c5*100:.0f}%, 周: {cw*100:.0f}%)"
-        return MODEL_CLAUDE_SONNET, reason
-    elif g5 >= 0.15 and gw >= 0.10:
-        if c5 < 0.15 or cw < 0.10:
-            reason = f"Claude 额度告急 (5h: {c5*100:.0f}%, 周: {cw*100:.0f}%) -> 自动切至 Gemini 续航 (5h: {g5*100:.0f}%)"
-        else:
-            reason = f"Gemini 额度更充沛 (G-5h: {g5*100:.0f}% > C-5h: {c5*100:.0f}%)"
-        return MODEL_GEMINI_FLASH, reason
-    else:
-        return MODEL_CLAUDE_SONNET, "额度均偏紧，默认保持 Claude Sonnet"
+    return evaluate_best_model_for_account("", parsed)
 
 def save_current_agy_to_pool(name=None):
     """Snapshots current active credentials from Windows Keyring into the ~/.antigravity_tools pool."""

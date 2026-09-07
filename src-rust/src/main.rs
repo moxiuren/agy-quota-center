@@ -850,14 +850,39 @@ struct ParsedQuota {
     gemini_5h_countdown: Option<String>,
     gemini_weekly_reset: Option<String>,
     gemini_weekly_countdown: Option<String>,
+    gemini_score: f64,
+    gemini_eligible: bool,
+    gemini_desc: String,
+
     claude_5h: Option<f64>,
     claude_weekly: Option<f64>,
     claude_5h_reset: Option<String>,
     claude_5h_countdown: Option<String>,
     claude_weekly_reset: Option<String>,
     claude_weekly_countdown: Option<String>,
+    claude_score: f64,
+    claude_eligible: bool,
+    claude_desc: String,
+
     effective_score: f64,
     score_desc: String,
+}
+
+#[derive(Clone, Debug)]
+struct MatrixSlotCandidate {
+    acc_id: String,
+    email: String,
+    #[allow(dead_code)]
+    model_name: String,
+    #[allow(dead_code)]
+    model_group: &'static str,
+    frac_5h: Option<f64>,
+    frac_w: Option<f64>,
+    cd_5h: Option<String>,
+    cd_w: Option<String>,
+    score: f64,
+    is_eligible: bool,
+    desc: String,
 }
 
 fn format_compact_countdown(target_iso: Option<&str>, frac: Option<f64>) -> String {
@@ -932,67 +957,161 @@ fn format_relative_time(iso_str: &str) -> (String, String) {
     }
 }
 
-fn score_single_model(frac_5h: Option<f64>, frac_w: Option<f64>, w_reset_iso: Option<&str>) -> (f64, &'static str) {
-    let f5 = frac_5h.unwrap_or(0.0);
-    let fw = frac_w.unwrap_or(0.0);
+fn is_claude_model(model_name: &str) -> bool {
+    let lower = model_name.to_lowercase();
+    lower.contains("claude") || lower.contains("opus") || lower.contains("sonnet") || lower.contains("gpt")
+}
 
-    if f5 <= 0.001 && fw <= 0.001 {
-        return (0.0, "已耗尽");
+fn score_matrix_slot(
+    email: &str,
+    model_name: &str,
+    f5_opt: Option<f64>,
+    fw_opt: Option<f64>,
+    w_reset_iso: Option<&str>,
+) -> (f64, bool, String) {
+    let f5 = f5_opt.unwrap_or(0.0);
+    let fw = fw_opt.unwrap_or(0.0);
+
+    if f5_opt.is_none() && fw_opt.is_none() {
+        return (0.0, false, "未获取到配额".to_string());
     }
 
-    // 基础容量：45% 即时5小时突发算力 + 55% 每周持久续航
+    let is_primary = email.trim().eq_ignore_ascii_case("moxiuren@gmail.com");
+
+    let rem_sec = if let Some(iso) = w_reset_iso {
+        if let Ok(dt) = DateTime::parse_from_rfc3339(iso) {
+            dt.signed_duration_since(Utc::now()).num_seconds().max(0)
+        } else {
+            7 * 86400
+        }
+    } else {
+        7 * 86400
+    };
+
+    if is_primary {
+        // === moxiuren@gmail.com 弟妹共享双轨安全防护机制 ===
+
+        // 轨1: 5小时短期突发槽位硬性留存防线 (任何时刻必须保持 >= 75%)
+        if f5 < 0.75 {
+            return (
+                0.0,
+                false,
+                format!("[留存保护: 5h余量 {:.0}% < 75% 共享硬防线]", f5 * 100.0),
+            );
+        }
+
+        // 轨2: 每周额度 48h 三阶梯渐进释放
+        if rem_sec > 48 * 3600 {
+            // 阶段1: 常规期 (剩余时间 > 48h)
+            // 周保留底线: 75% (日常仅允许借用至多 25% 额度)
+            if fw <= 0.75 {
+                return (
+                    0.0,
+                    false,
+                    format!("[留存保护: 常规期周余量 {:.0}% ≤ 75% 防线]", fw * 100.0),
+                );
+            }
+            let base = f5 * 0.45 + fw * 0.55;
+            let score = ((base * 0.30 * 100.0) * 10.0).round() / 10.0;
+            return (
+                score,
+                true,
+                format!("[主号常规留存 (0.30x): 5h={:.0}%, 周={:.0}%]", f5 * 100.0, fw * 100.0),
+            );
+        } else if rem_sec > 24 * 3600 {
+            // 阶段2: 临期2天跑道期 (24h < 剩余时间 <= 48h)
+            // 周保留底线: 50%
+            if fw <= 0.50 {
+                return (
+                    0.0,
+                    false,
+                    format!("[留存保护: 临期2天周余量 {:.0}% ≤ 50% 防线]", fw * 100.0),
+                );
+            }
+            let base = f5 * 0.45 + fw * 0.55;
+            let mult = if fw > 0.60 { 0.85 } else { 0.50 };
+            let score = ((base * mult * 100.0) * 10.0).round() / 10.0;
+            return (
+                score,
+                true,
+                format!("[主号临期2天释放 ({:.2}x): 5h={:.0}%, 周={:.0}%]", mult, f5 * 100.0, fw * 100.0),
+            );
+        } else {
+            // 阶段3: 终期最后24小时清仓冲刺 (剩余时间 <= 24h)
+            // 周保留底线: 25% (始终预留 25% 共享安全缓冲)
+            if fw <= 0.25 {
+                return (
+                    0.0,
+                    false,
+                    format!("[留存保护: 终期周余量 {:.0}% ≤ 25% 防线]", fw * 100.0),
+                );
+            }
+            let base = f5 * 0.45 + fw * 0.55;
+            let mult = if fw > 0.35 { 1.20 } else { 0.80 };
+            let score = ((base * mult * 100.0) * 10.0).round() / 10.0;
+            return (
+                score,
+                true,
+                format!("[主号最后24h清仓 ({:.2}x): 5h={:.0}%, 周={:.0}%]", mult, f5 * 100.0, fw * 100.0),
+            );
+        }
+    }
+
+    // === 专属工作账号 (Dedicated Accounts) ===
+    if f5 <= 0.05 && fw <= 0.05 {
+        return (0.0, false, "已耗尽".to_string());
+    }
+
     let base = f5 * 0.45 + fw * 0.55;
 
-    // 每周余量健康惩罚 (Damping)
     let (w_mult, w_status) = if fw < 0.15 {
-        (0.15, "周额告急")
+        (0.20, "周额告急")
     } else if fw < 0.25 {
-        (0.45, "周额偏低")
+        (0.50, "周额偏低")
     } else if fw < 0.50 {
         (0.85, "周额正常")
     } else {
         (1.0, "周额充足")
     };
 
-    // 5小时短期余量惩罚
-    let (h5_mult, h5_status) = if f5 < 0.05 {
-        (0.05, "5h触底")
-    } else if f5 < 0.20 {
-        (0.70, "5h偏紧")
+    let (h5_mult, h5_status) = if f5 < 0.15 {
+        (0.40, "5h触底")
+    } else if f5 < 0.25 {
+        (0.75, "5h偏紧")
     } else {
         (1.0, "5h充沛")
     };
 
-    // 周额度临近刷新紧迫度奖励 ("即将重置，抓紧释放")
-    let mut urgency_mult = 1.0;
-    let mut is_urgent = false;
-    if fw >= 0.20 {
-        if let Some(iso) = w_reset_iso {
-            if let Ok(dt) = DateTime::parse_from_rfc3339(iso) {
-                let diff_sec = dt.signed_duration_since(Utc::now()).num_seconds();
-                if diff_sec > 0 && diff_sec < 18 * 3600 {
-                    urgency_mult = 1.15;
-                    is_urgent = true;
-                }
-            }
-        }
-    }
+    let urgency_mult = if fw >= 0.25 && rem_sec <= 24 * 3600 { 1.15 } else { 1.0 };
 
-    let model_score = base * w_mult * h5_mult * urgency_mult;
-    let desc = if is_urgent {
-        "即将重置"
-    } else if f5 < 0.05 {
-        h5_status
-    } else if fw < 0.15 {
-        w_status
+    let is_claude = is_claude_model(model_name);
+    let tag_prefix = if is_claude { "Claude" } else { "Gemini" };
+
+    let raw = base * w_mult * h5_mult * urgency_mult * 100.0;
+    let score = (raw * 10.0).round() / 10.0;
+
+    let is_eligible = f5 > 0.15 && fw > 0.10;
+
+    let desc = if urgency_mult > 1.0 {
+        format!("[{} 临期重置冲刺]", tag_prefix)
+    } else if f5 < 0.15 {
+        format!("[{} {}]", tag_prefix, h5_status)
     } else {
-        w_status
+        format!("[{} {}]", tag_prefix, w_status)
     };
 
-    (model_score, desc)
+    (score, is_eligible && score > 0.0, desc)
 }
 
+#[allow(dead_code)]
+fn score_single_model(frac_5h: Option<f64>, frac_w: Option<f64>, w_reset_iso: Option<&str>) -> (f64, &'static str) {
+    let (s, _, _) = score_matrix_slot("", MODEL_GEMINI_FLASH, frac_5h, frac_w, w_reset_iso);
+    (s, "模型就绪")
+}
+
+#[allow(dead_code)]
 fn calculate_smart_score(
+    email: &str,
     g_5h: Option<f64>,
     g_w: Option<f64>,
     g_w_reset: Option<&str>,
@@ -1000,18 +1119,16 @@ fn calculate_smart_score(
     c_w: Option<f64>,
     c_w_reset: Option<&str>,
 ) -> (f64, String) {
-    let (g_score, g_tag) = score_single_model(g_5h, g_w, g_w_reset);
-    let (c_score, c_tag) = score_single_model(c_5h, c_w, c_w_reset);
+    let (g_score, _, g_desc) = score_matrix_slot(email, MODEL_GEMINI_FLASH, g_5h, g_w, g_w_reset);
+    let (c_score, _, c_desc) = score_matrix_slot(email, MODEL_CLAUDE_SONNET, c_5h, c_w, c_w_reset);
 
-    // 双模型加权调度总分 (Gemini 45% + Claude 55%) * 100.0
-    let total_score = (g_score * 0.45 + c_score * 0.55) * 100.0;
-    let rounded_score = (total_score * 10.0).round() / 10.0;
-    let desc = format!("G:[{}] C:[{}]", g_tag, c_tag);
+    let effective_score = c_score.max(g_score);
+    let desc = format!("G:[{}] C:[{}]", g_desc, c_desc);
 
-    (rounded_score, desc)
+    (effective_score, desc)
 }
 
-fn parse_quota_buckets(summary: &Value) -> ParsedQuota {
+fn parse_quota_buckets(summary: &Value, email: &str) -> ParsedQuota {
     let mut q = ParsedQuota::default();
     if let Some(groups) = summary.get("groups").and_then(|g| g.as_array()) {
         for g in groups {
@@ -1049,16 +1166,30 @@ fn parse_quota_buckets(summary: &Value) -> ParsedQuota {
     q.claude_5h_countdown = Some(format_compact_countdown(q.claude_5h_reset.as_deref(), q.claude_5h));
     q.claude_weekly_countdown = Some(format_compact_countdown(q.claude_weekly_reset.as_deref(), q.claude_weekly));
 
-    let (score, desc) = calculate_smart_score(
+    let (g_score, g_elig, g_desc) = score_matrix_slot(
+        email,
+        MODEL_GEMINI_FLASH,
         q.gemini_5h,
         q.gemini_weekly,
         q.gemini_weekly_reset.as_deref(),
+    );
+    q.gemini_score = g_score;
+    q.gemini_eligible = g_elig;
+    q.gemini_desc = g_desc;
+
+    let (c_score, c_elig, c_desc) = score_matrix_slot(
+        email,
+        MODEL_CLAUDE_SONNET,
         q.claude_5h,
         q.claude_weekly,
         q.claude_weekly_reset.as_deref(),
     );
-    q.effective_score = score;
-    q.score_desc = desc;
+    q.claude_score = c_score;
+    q.claude_eligible = c_elig;
+    q.claude_desc = c_desc;
+
+    q.effective_score = q.claude_score.max(q.gemini_score);
+    q.score_desc = format!("G:[{:.1}分] C:[{:.1}分]", q.gemini_score, q.claude_score);
 
     q
 }
@@ -1352,87 +1483,21 @@ const MODEL_CLAUDE_OPUS: &str = "Claude Opus 4.6 (Thinking)";
 const MODEL_GEMINI_FLASH: &str = "Gemini 3.8 Flash (High)";
 const MODEL_GEMINI_PRO: &str = "Gemini 3.1 Pro (High)";
 
-fn evaluate_best_model_for_quota(q: &ParsedQuota) -> (&'static str, String) {
-    let c5 = q.claude_5h.unwrap_or(0.0);
-    let cw = q.claude_weekly.unwrap_or(0.0);
-    let g5 = q.gemini_5h.unwrap_or(0.0);
-    let gw = q.gemini_weekly.unwrap_or(0.0);
-
-    // 核心判定：当前如果 Claude 模型配额比较多，优先切换去 Claude Sonnet 进行使用
-    // 条件1: Claude 处于充沛可用状态 (5h >= 25% 且周额度 >= 15%)
-    // 条件2: 或 Claude 5h 剩余量 >= Gemini 5h 剩余量 且未告急 (5h >= 20% 且周额度 >= 10%)
-    let claude_healthy = c5 >= 0.25 && cw >= 0.15;
-    let claude_superior = c5 >= 0.20 && cw >= 0.10 && c5 >= g5;
-
-    if claude_healthy || claude_superior {
-        let reason = format!(
-            "Claude 额度充沛 (5h: {:.0}%, 周: {:.0}%)",
-            c5 * 100.0, cw * 100.0
-        );
-        (MODEL_CLAUDE_SONNET, reason)
-    } else if g5 >= 0.15 && gw >= 0.10 {
-        let reason = if c5 < 0.15 || cw < 0.10 {
-            format!(
-                "Claude 额度告急 (5h: {:.0}%, 周: {:.0}%) -> 自动切至 Gemini 续航 (5h: {:.0}%)",
-                c5 * 100.0, cw * 100.0, g5 * 100.0
-            )
-        } else {
-            format!(
-                "Gemini 额度更充沛 (G-5h: {:.0}% > C-5h: {:.0}%)",
-                g5 * 100.0, c5 * 100.0
-            )
-        };
-        (MODEL_GEMINI_FLASH, reason)
-    } else {
-        (MODEL_CLAUDE_SONNET, "额度均偏紧，默认保持 Claude Sonnet".to_string())
-    }
-}
-
 fn option_switch_model() {
     clear_screen();
     let cur_model = get_active_model_setting();
     println!("{}=== 切换全局默认模型 (Switch Default Model) ==={}", C_BOLD, C_RESET);
     println!("当前全局默认模型: {}{}{}\n", C_CYAN, cur_model, C_RESET);
-    println!("请选择切换目标:");
+    println!("请选择切换目标 (锁定后，自动切号与守护将仅在该模型的账号配额池中轮换):");
     println!("  {} [1] Claude Sonnet 4.6 (Thinking)  (深度推理与架构设计)", C_MAGENTA);
     println!("  {} [2] Claude Opus 4.6 (Thinking)    (终极推理与长链复杂任务)", C_MAGENTA);
     println!("  {} [3] Gemini 3.8 Flash (High)       (超快响应与代码极速生成)", C_BLUE);
     println!("  {} [4] Gemini 3.1 Pro (High)         (超大上下文长文本分析)", C_BLUE);
-    println!("  {} [5] 智能自动推荐 (Auto)            (根据当前账号配额自动匹配最优模型)", C_GREEN);
     println!("  {} [0] 返回主菜单{}", C_DIM, C_RESET);
-    print!("\n>> 请输入选项 [1-5, 0]: ");
+    print!("\n>> 请输入选项 [1-4, 0]: ");
     let _ = io::stdout().flush();
     let mut choice = String::new();
     let _ = io::stdin().read_line(&mut choice);
-
-    if choice.trim() == "5" {
-        println!("\n{}[*] 正在分析当前账号配额以推荐最优模型...{}", C_CYAN, C_RESET);
-        let (rows, current_id, _) = fetch_all_accounts_data();
-        let cur_parsed = rows
-            .iter()
-            .find(|r| current_id.as_deref() == Some(&r.acc.id))
-            .and_then(|r| r.parsed.as_ref());
-        if let Some(q) = cur_parsed {
-            let (target_m, reason) = evaluate_best_model_for_quota(q);
-            if let Ok(()) = set_active_model_setting(target_m) {
-                println!("\n{}{}[+] 智能模型匹配成功！{}", C_BOLD, C_GREEN, C_RESET);
-                println!("    -> 判定依据: {}", reason);
-                println!("    -> 默认模型已切换为: {}{}{}", C_CYAN, target_m, C_RESET);
-                let cnt = reload_all_active_agy_sessions();
-                if cnt > 0 {
-                    println!("{}{}[通过] 成功重启并恢复了 {} 个 agy 终端窗口！{}", C_BOLD, C_GREEN, cnt, C_RESET);
-                } else {
-                    println!("{}[信息] 新配置已写入 settings.json，下次启动 agy 时生效。{}", C_DIM, C_RESET);
-                }
-            } else {
-                println!("\n{}{}[-] 保存模型配置失败{}", C_BOLD, C_RED, C_RESET);
-            }
-        } else {
-            println!("{}[-] 无法读取当前账号配额信息。{}", C_RED, C_RESET);
-        }
-        pause();
-        return;
-    }
 
     let target_model = match choice.trim() {
         "1" => Some(MODEL_CLAUDE_SONNET),
@@ -1445,7 +1510,7 @@ fn option_switch_model() {
     if let Some(m) = target_model {
         if let Ok(()) = set_active_model_setting(m) {
             println!("\n{}{}[+] 默认模型已成功更新为: {}{}", C_BOLD, C_GREEN, m, C_RESET);
-            println!("新启动的 agy 终端会话将默认直接加载该模型。");
+            println!("切号中心与守护服务将保持此模型，并在该模型的账号池中调度。");
             let cnt = reload_all_active_agy_sessions();
             if cnt > 0 {
                 println!("{}{}[通过] 成功重启并恢复了 {} 个 agy 终端窗口！{}", C_BOLD, C_GREEN, cnt, C_RESET);
@@ -1581,9 +1646,89 @@ struct AccountRow {
     err: Option<String>,
 }
 
+fn generate_matrix_slots(
+    rows: &[AccountRow],
+    current_id: Option<&str>,
+    cur_model: &str,
+) -> (Vec<MatrixSlotCandidate>, Option<MatrixSlotCandidate>) {
+    let is_claude = is_claude_model(cur_model);
+    let mut slots = Vec::new();
+    for r in rows {
+        if let Some(p) = &r.parsed {
+            let (f5, fw, cd5, cdw, w_reset) = if is_claude {
+                (
+                    p.claude_5h,
+                    p.claude_weekly,
+                    p.claude_5h_countdown.clone(),
+                    p.claude_weekly_countdown.clone(),
+                    p.claude_weekly_reset.as_deref(),
+                )
+            } else {
+                (
+                    p.gemini_5h,
+                    p.gemini_weekly,
+                    p.gemini_5h_countdown.clone(),
+                    p.gemini_weekly_countdown.clone(),
+                    p.gemini_weekly_reset.as_deref(),
+                )
+            };
+
+            let (score, is_eligible, desc) = score_matrix_slot(
+                &r.acc.email,
+                cur_model,
+                f5,
+                fw,
+                w_reset,
+            );
+
+            slots.push(MatrixSlotCandidate {
+                acc_id: r.acc.id.clone(),
+                email: r.acc.email.clone(),
+                model_name: cur_model.to_string(),
+                model_group: if is_claude { "Claude" } else { "Gemini" },
+                frac_5h: f5,
+                frac_w: fw,
+                cd_5h: cd5,
+                cd_w: cdw,
+                score,
+                is_eligible,
+                desc,
+            });
+        }
+    }
+
+    slots.sort_by(|a, b| {
+        if a.is_eligible != b.is_eligible {
+            return b.is_eligible.cmp(&a.is_eligible);
+        }
+        match b.score.partial_cmp(&a.score) {
+            Some(std::cmp::Ordering::Equal) | None => {},
+            Some(ord) => return ord,
+        }
+        let a_is_cur = current_id == Some(&a.acc_id);
+        let b_is_cur = current_id == Some(&b.acc_id);
+        if a_is_cur != b_is_cur {
+            return b_is_cur.cmp(&a_is_cur);
+        }
+        let a_5h = a.frac_5h.unwrap_or(0.0);
+        let b_5h = b.frac_5h.unwrap_or(0.0);
+        match b_5h.partial_cmp(&a_5h) {
+            Some(std::cmp::Ordering::Equal) | None => {},
+            Some(ord) => return ord,
+        }
+        let a_w = a.frac_w.unwrap_or(0.0);
+        let b_w = b.frac_w.unwrap_or(0.0);
+        b_w.partial_cmp(&a_w).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let best_slot = slots.iter().find(|s| s.is_eligible && s.score > 0.0).cloned();
+    (slots, best_slot)
+}
+
 fn fetch_all_accounts_data() -> (Vec<AccountRow>, Option<String>, Option<AccountSummary>) {
     let idx = load_account_index();
     let current_id = idx.current_account_id.clone();
+    let cur_model = get_active_model_setting();
     let mut rows = Vec::new();
 
     for a in &idx.accounts {
@@ -1591,7 +1736,7 @@ fn fetch_all_accounts_data() -> (Vec<AccountRow>, Option<String>, Option<Account
         let (parsed, err) = if let Some(mut acc) = load_account(&sid) {
             match ensure_valid_token(&mut acc) {
                 Ok(tok) => match fetch_quota_summary(&tok) {
-                    Ok(sum) => (Some(parse_quota_buckets(&sum)), None),
+                    Ok(sum) => (Some(parse_quota_buckets(&sum, &a.email)), None),
                     Err(e) => (None, Some(e)),
                 },
                 Err(e) => (None, Some(e)),
@@ -1606,30 +1751,13 @@ fn fetch_all_accounts_data() -> (Vec<AccountRow>, Option<String>, Option<Account
         });
     }
 
-    let cur_score = rows
-        .iter()
-        .find(|r| current_id.as_deref() == Some(&r.acc.id))
-        .and_then(|r| r.parsed.as_ref())
-        .map(|p| p.effective_score)
-        .unwrap_or(-1.0);
-
-    let mut best_other_score = -1.0;
-    let mut best_other_acc: Option<AccountSummary> = None;
-    for r in &rows {
-        let is_cur = current_id.as_deref() == Some(&r.acc.id);
-        if !is_cur {
-            if let Some(p) = &r.parsed {
-                if p.effective_score > best_other_score {
-                    best_other_score = p.effective_score;
-                    best_other_acc = Some(r.acc.clone());
-                }
-            }
+    let (_, best_slot) = generate_matrix_slots(&rows, current_id.as_deref(), &cur_model);
+    let best_acc = if let Some(best) = best_slot {
+        if current_id.as_deref() != Some(&best.acc_id) {
+            rows.iter().find(|r| r.acc.id == best.acc_id).map(|r| r.acc.clone())
+        } else {
+            None
         }
-    }
-
-    // 若其他账号得分比当前账号高出 1 分以上，或者当前账号已告急耗尽 (得分 < 10 分)，推荐切换
-    let best_acc = if (best_other_score > cur_score + 1.0 || cur_score < 10.0) && best_other_score > 0.0 {
-        best_other_acc
     } else {
         None
     };
@@ -1640,6 +1768,7 @@ fn fetch_all_accounts_data() -> (Vec<AccountRow>, Option<String>, Option<Account
 struct AutoSwitchResult {
     account_switched: bool,
     account_email: String,
+    #[allow(dead_code)]
     model_switched: bool,
     active_model: String,
     model_reason: String,
@@ -1647,57 +1776,153 @@ struct AutoSwitchResult {
 }
 
 fn auto_switch_account_and_model(_silent: bool) -> Result<AutoSwitchResult, String> {
-    let (rows, current_id, best_acc) = fetch_all_accounts_data();
+    let (rows, current_id, _) = fetch_all_accounts_data();
     let cur_model = get_active_model_setting();
+    let (slots, best_slot) = generate_matrix_slots(&rows, current_id.as_deref(), &cur_model);
 
-    // 1. 目标账号决策
-    let (target_acc, account_switched) = if let Some(best) = best_acc {
-        (best, true)
-    } else {
-        let cur_acc = rows
-            .iter()
-            .find(|r| current_id.as_deref() == Some(&r.acc.id))
-            .map(|r| r.acc.clone())
-            .ok_or_else(|| "未找到当前活动账号".to_string())?;
-        (cur_acc, false)
-    };
-
-    // 2. 目标账号对应的配额信息
-    let target_parsed_opt = rows
+    let cur_acc = rows
         .iter()
-        .find(|r| r.acc.id == target_acc.id)
-        .and_then(|r| r.parsed.as_ref());
+        .find(|r| current_id.as_deref() == Some(&r.acc.id))
+        .map(|r| r.acc.clone())
+        .ok_or_else(|| "未找到当前活动账号".to_string())?;
 
-    // 3. 模型决策：当前如果 Claude 模型配额比较多，优先自动切换至 Claude Sonnet，否则平滑降级至 Gemini
-    let (target_model, model_reason) = match target_parsed_opt {
-        Some(q) => evaluate_best_model_for_quota(q),
-        None => (MODEL_GEMINI_FLASH, "未获取到配额，默认 Gemini".to_string()),
-    };
-    let model_switched = cur_model != target_model;
+    let cur_slot_opt = slots.iter().find(|s| current_id.as_deref() == Some(&s.acc_id));
 
-    // 4. 执行凭据与模型配置覆写
-    if account_switched {
-        switch_account_credentials_only(&target_acc.id)?;
-    }
-    if model_switched {
-        let _ = set_active_model_setting(target_model);
-    }
+    if let Some(target) = best_slot {
+        let is_same_acc = cur_acc.id == target.acc_id;
 
-    // 5. 若账号或模型发生变化，统一触发所有运行中会话协同热重载
-    let reloaded_sessions = if account_switched || model_switched {
-        reload_all_active_agy_sessions()
+        let need_switch = if is_same_acc {
+            false
+        } else if let Some(cur) = cur_slot_opt {
+            if !cur.is_eligible {
+                true
+            } else if target.score > cur.score + 1.0 {
+                true
+            } else {
+                false
+            }
+        } else {
+            true
+        };
+
+        if need_switch {
+            switch_account_credentials_only(&target.acc_id)?;
+            let reloaded_sessions = reload_all_active_agy_sessions();
+
+            Ok(AutoSwitchResult {
+                account_switched: true,
+                account_email: target.email,
+                model_switched: false,
+                active_model: cur_model,
+                model_reason: target.desc,
+                reloaded_sessions,
+            })
+        } else {
+            Ok(AutoSwitchResult {
+                account_switched: false,
+                account_email: cur_acc.email,
+                model_switched: false,
+                active_model: cur_model,
+                model_reason: cur_slot_opt.map(|s| s.desc.clone()).unwrap_or_else(|| "当前处于最佳可用状态".to_string()),
+                reloaded_sessions: 0,
+            })
+        }
     } else {
-        0
+        Ok(AutoSwitchResult {
+            account_switched: false,
+            account_email: cur_acc.email,
+            model_switched: false,
+            active_model: cur_model.clone(),
+            model_reason: format!("所有账号在当前模型 [{}] 下均处于耗尽或留存保护状态", cur_model),
+            reloaded_sessions: 0,
+        })
+    }
+}
+
+fn print_matrix_slots_table(
+    slots: &[MatrixSlotCandidate],
+    current_acc_id: Option<&str>,
+    current_model: &str,
+    best_slot: Option<&MatrixSlotCandidate>,
+) {
+    println!("\n{}{}=== 全局账号在当前模型 [ {}{}{} ] 下的算力排位 ==={}", C_BOLD, C_CYAN, C_RESET, current_model, C_CYAN, C_RESET);
+    let header = format!(
+        " {} {} {} {} {} {} {}",
+        pad_visual("#", 4),
+        pad_visual("评分", 8),
+        pad_visual("邮箱账号", 24),
+        pad_visual("5h余量(刷新)", 18),
+        pad_visual("周余量(刷新)", 18),
+        pad_visual("状态", 8),
+        pad_visual("调度策略说明", 28),
+    );
+    println!("{}", header);
+    println!("{}", "-".repeat(110));
+
+    let fmt_pct = |val: Option<f64>| -> String {
+        match val {
+            Some(v) => {
+                let pct = v * 100.0;
+                if pct >= 50.0 {
+                    format!("{}{:3.0}%{}", C_GREEN, pct, C_RESET)
+                } else if pct >= 20.0 {
+                    format!("{}{:3.0}%{}", C_YELLOW, pct, C_RESET)
+                } else {
+                    format!("{}{:3.0}%{}", C_RED, pct, C_RESET)
+                }
+            }
+            None => format!("{} --{}", C_DIM, C_RESET),
+        }
     };
 
-    Ok(AutoSwitchResult {
-        account_switched,
-        account_email: target_acc.email,
-        model_switched,
-        active_model: target_model.to_string(),
-        model_reason,
-        reloaded_sessions,
-    })
+    for (idx, s) in slots.iter().enumerate() {
+        let is_cur = current_acc_id == Some(&s.acc_id);
+        let is_best = best_slot.as_ref().map(|b| b.acc_id.as_str()) == Some(&s.acc_id) && !is_cur;
+
+        let status_tag = if is_cur {
+            format!("{}[当前*]{}", C_GREEN, C_RESET)
+        } else if is_best {
+            format!("{}[推荐*]{}", C_MAGENTA, C_RESET)
+        } else if !s.is_eligible {
+            format!("{}[受限]{}", C_RED, C_RESET)
+        } else {
+            format!("{}[就绪]{}", C_CYAN, C_RESET)
+        };
+
+        let email_colored = if is_cur {
+            format!("{}{}{}{}", C_BOLD, C_WHITE, s.email, C_RESET)
+        } else if is_best {
+            format!("{}{}{}", C_MAGENTA, s.email, C_RESET)
+        } else {
+            s.email.clone()
+        };
+
+        let cd_5h = s.cd_5h.as_deref().unwrap_or("--");
+        let cd_w = s.cd_w.as_deref().unwrap_or("--");
+        let g5_display = format!("{} ({})", fmt_pct(s.frac_5h), cd_5h);
+        let gw_display = format!("{} ({})", fmt_pct(s.frac_w), cd_w);
+
+        let score_colored = if s.score >= 100.0 {
+            format!("{}{:5.1}分{}", C_GREEN, s.score, C_RESET)
+        } else if s.score >= 40.0 {
+            format!("{}{:5.1}分{}", C_YELLOW, s.score, C_RESET)
+        } else {
+            format!("{}{:5.1}分{}", C_RED, s.score, C_RESET)
+        };
+
+        let row = format!(
+            " {} {} {} {} {} {} {}",
+            pad_visual(&format!("[{}]", idx + 1), 4),
+            pad_visual(&score_colored, 8),
+            pad_visual(&email_colored, 24),
+            pad_visual(&g5_display, 18),
+            pad_visual(&gw_display, 18),
+            pad_visual(&status_tag, 8),
+            pad_visual(&s.desc, 28)
+        );
+        println!("{}", row);
+    }
+    println!("{}", "-".repeat(110));
 }
 
 fn print_accounts_table(rows: &[AccountRow], current_id: Option<&str>, best_acc: Option<&AccountSummary>) {
@@ -1926,16 +2151,8 @@ fn option_switch_account() {
             println!("\n{}{}[+] 账号切换成功！当前活动账号已切换为: {}{}", C_BOLD, C_GREEN, email, C_RESET);
             println!("{}凭据已更新至系统凭据管理器与本地配置。{}", C_DIM, C_RESET);
 
-            if let Some(target_row) = rows.iter().find(|r| r.acc.id == target_id) {
-                if let Some(q) = &target_row.parsed {
-                    let cur_model = get_active_model_setting();
-                    let (rec_model, rec_reason) = evaluate_best_model_for_quota(q);
-                    if rec_model != cur_model {
-                        let _ = set_active_model_setting(rec_model);
-                        println!("{}{}[+] 智能模型联动: 检测到目标账号 {}，已自动适配默认模型为: {}{}{}", C_BOLD, C_GREEN, rec_reason, C_BOLD, rec_model, C_RESET);
-                    }
-                }
-            }
+            let cur_model = get_active_model_setting();
+            println!("{}[*] 当前默认模型保持为: {}{}{}", C_DIM, C_CYAN, cur_model, C_RESET);
 
             if count > 0 {
                 println!("{}{}[通过] 成功重启并恢复了 {} 个 agy 终端窗口！{}", C_BOLD, C_GREEN, count, C_RESET);
@@ -1950,44 +2167,33 @@ fn option_switch_account() {
     pause();
 }
 
-// [4] 智能切至最高额度账号与模型
+// [4] 智能切至当前模型最高额度账号
 fn option_auto_switch() {
     clear_screen();
-    println!("\n{}{}[*] 正在智能分析各账号 5h / 周额度综合调度得分与模型配置...{}", C_BOLD, C_CYAN, C_RESET);
+    let cur_model = get_active_model_setting();
+    println!("\n{}{}[*] 正在智能分析全局账号在当前模型 [ {}{}{} ] 下的算力排位...{}", C_BOLD, C_CYAN, C_RESET, cur_model, C_CYAN, C_RESET);
     let (rows, current_id, _) = fetch_all_accounts_data();
+    let (slots, best_slot) = generate_matrix_slots(&rows, current_id.as_deref(), &cur_model);
 
-    println!("\n各账号智能综合调度评分:");
-    for (idx, r) in rows.iter().enumerate() {
-        let is_cur = current_id.as_deref() == Some(&r.acc.id);
-        let tag = if is_cur { "[当前*]" } else { "       " };
-        let score_str = match &r.parsed {
-            Some(p) => format!("{:5.1} 分 ({})", p.effective_score, p.score_desc),
-            None => format!("  0.0 分 ({})", r.err.as_deref().unwrap_or("异常")),
-        };
-        println!("  {} [{}] {:26} -> {}", tag, idx + 1, r.acc.email, score_str);
-    }
+    print_matrix_slots_table(&slots, current_id.as_deref(), &cur_model, best_slot.as_ref());
     println!();
 
     match auto_switch_account_and_model(false) {
         Ok(res) => {
             if res.account_switched {
-                println!("{}{}[+] 账号切换成功！已切至最优配额账号: {}{}", C_BOLD, C_GREEN, res.account_email, C_RESET);
+                println!("{}{}[+] 账号切换成功！已切至最优算力账号: {}{}", C_BOLD, C_GREEN, res.account_email, C_RESET);
             } else {
-                println!("{}[*] 当前活动账号 ({}) 即为最高额度账号。{}", C_DIM, res.account_email, C_RESET);
+                println!("{}[*] 账号状态: 当前活动账号 ({}) 即为当前模型下的最优算力账号。{}", C_DIM, res.account_email, C_RESET);
             }
 
-            if res.model_switched {
-                println!("{}{}[+] 智能模型联动: 检测到 {}，已自动将全局默认模型切换为: {}{}{}", C_BOLD, C_GREEN, res.model_reason, C_BOLD, res.active_model, C_RESET);
-            } else {
-                println!("{}[*] 模型状态: 当前默认模型 ({}) 与配额最佳适配 ({})。{}", C_DIM, res.active_model, res.model_reason, C_RESET);
-            }
+            println!("{}[*] 模型状态: 保持当前默认模型 {}{}{} ({})", C_DIM, C_CYAN, res.active_model, C_RESET, res.model_reason);
 
             if res.reloaded_sessions > 0 {
-                println!("{}{}[通过] 成功重启并恢复了 {} 个 agy 终端窗口！{}", C_BOLD, C_GREEN, res.reloaded_sessions, C_RESET);
-            } else if res.account_switched || res.model_switched {
-                println!("{}[信息] 新配置已写入系统凭据与 settings.json，下次启动 agy 时生效。{}", C_DIM, C_RESET);
+                println!("{}{}[通过] 成功热重载并恢复了 {} 个 agy 终端会话！{}", C_BOLD, C_GREEN, res.reloaded_sessions, C_RESET);
+            } else if res.account_switched {
+                println!("{}[信息] 新凭据已写入系统凭据与本地配置，下次启动 agy 时生效。{}", C_DIM, C_RESET);
             } else {
-                println!("{}[!] 当前账号与模型均处于最佳状态，无需变动。{}", C_YELLOW, C_RESET);
+                println!("{}[!] 当前活动账号配额充沛，无需变动。{}", C_YELLOW, C_RESET);
             }
         }
         Err(e) => {
@@ -2120,7 +2326,7 @@ fn run_guard_daemon(silent: bool) {
     let mut last_switch_time: Option<Instant> = None;
     let switch_cooldown = Duration::from_secs(60);
     let mut check_count: u64 = 0;
-    let mut cached_candidates: Vec<(String, f64)> = Vec::new();
+    let mut cached_candidates: Vec<MatrixSlotCandidate> = Vec::new();
     let mut last_quota_metric: Option<(Instant, f64)> = None;
     let mut calculated_burn_rate: Option<f64> = None;
 
@@ -2169,7 +2375,7 @@ fn run_guard_daemon(silent: bool) {
                 match ensure_valid_token(&mut acc) {
                     Ok(tok) => match fetch_quota_summary(&tok) {
                         Ok(sum) => {
-                            cur_quota_opt = Some(parse_quota_buckets(&sum));
+                            cur_quota_opt = Some(parse_quota_buckets(&sum, &cur_email));
                         }
                         Err(e) => {
                             fetch_err_opt = Some(e);
@@ -2186,16 +2392,15 @@ fn run_guard_daemon(silent: bool) {
             fetch_err_opt = Some("账号池为空或未激活任何账号".to_string());
         }
 
-        // 定期或在首轮同步备选账号池评分
+        // 定期或在首轮同步备选账号池矩阵排位
         if check_count == 1 || check_count % 10 == 0 || cached_candidates.is_empty() {
             let (all_rows, _, _) = fetch_all_accounts_data();
-            let mut list: Vec<(String, f64)> = all_rows
+            let cur_m = get_active_model_setting();
+            let (slots, _) = generate_matrix_slots(&all_rows, Some(&current_acc_id), &cur_m);
+            cached_candidates = slots
                 .into_iter()
-                .filter(|r| r.acc.id != current_acc_id)
-                .map(|r| (r.acc.email.clone(), r.parsed.as_ref().map(|p| p.effective_score).unwrap_or(0.0)))
+                .filter(|s| s.acc_id != current_acc_id)
                 .collect();
-            list.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            cached_candidates = list;
         }
 
         let mut need_switch = false;
@@ -2219,7 +2424,7 @@ fn run_guard_daemon(silent: bool) {
         };
 
         let cur_model = get_active_model_setting();
-        let is_using_claude = cur_model.to_lowercase().contains("claude");
+        let is_using_claude = is_claude_model(&cur_model);
 
         let min_5h = if is_using_claude {
             cur_quota_opt.as_ref().and_then(|q| q.claude_5h).unwrap_or(1.0)
@@ -2261,46 +2466,58 @@ fn run_guard_daemon(silent: bool) {
             let gw = q.gemini_weekly.unwrap_or(1.0);
             let cw = q.claude_weekly.unwrap_or(1.0);
 
-            // 1. 如果当前在使用 Gemini，但检测到 Claude 额度充沛 (5h >= 25% 且周额 >= 15%)，自动无感切去 Claude Sonnet
-            if !is_using_claude && (c5 >= 0.25 && cw >= 0.15) && !in_cooldown {
-                let upgrade_log = format!(
-                    "{}[模型升级] 检测到当前账号 Claude 额度充沛 (5h: {:.0}%, 周: {:.0}%)，自动切换至 Claude Sonnet 4.6 (Thinking)...{}",
-                    C_CYAN, c5 * 100.0, cw * 100.0, C_RESET
-                );
-                log_guard_event(&upgrade_log, silent);
-                let _ = set_active_model_setting(MODEL_CLAUDE_SONNET);
-                let cnt = reload_all_active_agy_sessions();
-                let notify_msg = format!("Claude 额度充沛 (5h: {:.0}%)，已自动切换至 Claude Sonnet 4.6", c5 * 100.0);
-                log_guard_event(&format!("{}[完成] 默认模型已切换为 Claude Sonnet 4.6 (Thinking) | 已热重载 {} 个终端{}", C_GREEN, cnt, C_RESET), silent);
-                send_desktop_notification("Antigravity 智能模型切换", &notify_msg);
-                last_switch_time = Some(Instant::now());
-            }
+            let is_primary_shared = cur_email.trim().eq_ignore_ascii_case("moxiuren@gmail.com");
 
-            // 2. 检查当前正在使用的模型是否额度告急
-            if is_using_claude {
-                if c5 <= 0.15 {
+            if is_primary_shared {
+                // === moxiuren@gmail.com 弟妹共享双轨实时防线 ===
+                if min_5h <= 0.75 {
                     need_switch = true;
-                    trigger_reason = format!("Claude 5h 额度告急 ≤ 15% (当前: {:.0}%)", c5 * 100.0);
-                } else if cw <= 0.10 {
-                    need_switch = true;
-                    trigger_reason = format!("Claude 周额度告急 ≤ 10% (当前: {:.0}%)", cw * 100.0);
+                    trigger_reason = format!("主号触发弟妹5h硬性保底线 (当前: {:.0}% ≤ 75%)", min_5h * 100.0);
+                } else {
+                    let w_iso = if is_using_claude { q.claude_weekly_reset.as_deref() } else { q.gemini_weekly_reset.as_deref() };
+                    let rem_sec = if let Some(iso) = w_iso {
+                        if let Ok(dt) = DateTime::parse_from_rfc3339(iso) {
+                            dt.signed_duration_since(Utc::now()).num_seconds().max(0)
+                        } else {
+                            7 * 86400
+                        }
+                    } else {
+                        7 * 86400
+                    };
+
+                    let cur_w = if is_using_claude { cw } else { gw };
+
+                    if rem_sec > 48 * 3600 && cur_w <= 0.75 {
+                        need_switch = true;
+                        trigger_reason = format!("主号常规期周额达75%共享留存线 (当前: {:.0}% ≤ 75%)", cur_w * 100.0);
+                    } else if rem_sec > 24 * 3600 && cur_w <= 0.50 {
+                        need_switch = true;
+                        trigger_reason = format!("主号临期2天周额达50%共享留存线 (当前: {:.0}% ≤ 50%)", cur_w * 100.0);
+                    } else if rem_sec <= 24 * 3600 && cur_w <= 0.25 {
+                        need_switch = true;
+                        trigger_reason = format!("主号终期周额达25%共享保底线 (当前: {:.0}% ≤ 25%)", cur_w * 100.0);
+                    }
                 }
             } else {
-                if g5 <= 0.15 {
-                    need_switch = true;
-                    trigger_reason = format!("Gemini 5h 额度告急 ≤ 15% (当前: {:.0}%)", g5 * 100.0);
-                } else if gw <= 0.10 {
-                    need_switch = true;
-                    trigger_reason = format!("Gemini 周额度告急 ≤ 10% (当前: {:.0}%)", gw * 100.0);
+                // === 专属工作账号 ===
+                if is_using_claude {
+                    if c5 <= 0.15 {
+                        need_switch = true;
+                        trigger_reason = format!("Claude 5h 额度告急 ≤ 15% (当前: {:.0}%)", c5 * 100.0);
+                    } else if cw <= 0.10 {
+                        need_switch = true;
+                        trigger_reason = format!("Claude 周额度告急 ≤ 10% (当前: {:.0}%)", cw * 100.0);
+                    }
+                } else {
+                    // 当前在使用 Gemini
+                    if g5 <= 0.15 {
+                        need_switch = true;
+                        trigger_reason = format!("Gemini 5h 额度告急 ≤ 15% (当前: {:.0}%)", g5 * 100.0);
+                    } else if gw <= 0.10 {
+                        need_switch = true;
+                        trigger_reason = format!("Gemini 周额度告急 ≤ 10% (当前: {:.0}%)", gw * 100.0);
+                    }
                 }
-            }
-
-            if q.effective_score < 30.0 {
-                need_switch = true;
-                trigger_reason = format!(
-                    "综合调度得分过低 ({:.1} 分 < 30.0)，算力告竭",
-                    q.effective_score
-                );
             }
         } else if let Some(err) = &fetch_err_opt {
             if err.contains("429") || err.contains("ResourceExhausted") || err.contains("RESOURCE_EXHAUSTED") {
@@ -2351,19 +2568,25 @@ fn run_guard_daemon(silent: bool) {
                 C_GREEN, rate, time_desc, C_RESET
             )
         } else if let Some(q) = &cur_quota_opt {
-            if min_5h > 0.60 {
+            let is_primary_shared = cur_email.trim().eq_ignore_ascii_case("moxiuren@gmail.com");
+            if is_primary_shared {
                 format!(
-                    "{}[配额超充沛 (综合评分: {:.1}) | 待机或低速中 | 预计切号: 2+小时以上 (当 5h 余量 ≤ 15% 时自动秒切)]{}",
+                    "{}[主号弟妹共享保护运行中 | 5h留存保底线: 75% | 当前 5h: {:.0}%, 评分: {:.1}]{}",
+                    C_CYAN, min_5h * 100.0, q.effective_score, C_RESET
+                )
+            } else if min_5h > 0.60 {
+                format!(
+                    "{}[配额超充沛 (调度评分: {:.1}) | 待机或低速中 | 预计切号: 2+小时以上 (当 5h 余量 ≤ 15% 时自动秒切)]{}",
                     C_GREEN, q.effective_score, C_RESET
                 )
             } else if min_5h > 0.35 {
                 format!(
-                    "{}[配额充沛 (综合评分: {:.1}) | 平稳运行中 | 预计切号: 1+小时以上 (当 5h 余量 ≤ 15% 时自动秒切)]{}",
+                    "{}[配额充沛 (调度评分: {:.1}) | 平稳运行中 | 预计切号: 1+小时以上 (当 5h 余量 ≤ 15% 时自动秒切)]{}",
                     C_GREEN, q.effective_score, C_RESET
                 )
             } else {
                 format!(
-                    "{}[余量适中 (综合评分: {:.1}) | 预计切号: 当 5h 余量 ≤ 15% 或遭遇 429 频控时自动秒切]{}",
+                    "{}[余量适中 (调度评分: {:.1}) | 预计切号: 当 5h 余量 ≤ 15% 或遭遇 429 频控时自动秒切]{}",
                     C_GREEN, q.effective_score, C_RESET
                 )
             }
@@ -2374,10 +2597,15 @@ fn run_guard_daemon(silent: bool) {
         let candidate_line = if !cached_candidates.is_empty() {
             let top_candidates: Vec<String> = cached_candidates
                 .iter()
+                .filter(|s| s.is_eligible && s.score > 0.0)
                 .take(2)
-                .map(|(email, score)| format!("{} ({:.1}分)", email, score))
+                .map(|s| format!("{} ({:.1}分)", s.email, s.score))
                 .collect();
-            top_candidates.join(" | ")
+            if top_candidates.is_empty() {
+                format!("无其他可用账号 (当前模型 [{}] 额度全部耗尽或留存保护)", cur_model)
+            } else {
+                top_candidates.join(" | ")
+            }
         } else {
             "暂无备选".to_string()
         };
@@ -2389,34 +2617,34 @@ fn run_guard_daemon(silent: bool) {
         log_guard_event(&log_text, silent);
 
         if need_switch && !in_cooldown {
-            let warn_log = format!("{}[告警] 检测到当前账号达到切号/切模型阈值 ({})，正在检索最优候选目标...{}", C_YELLOW, trigger_reason, C_RESET);
+            let warn_log = format!("{}[告警] 检测到当前账号在模型 [{}] 下达到切号阈值 ({})，正在检索最优候选账号...{}", C_YELLOW, cur_model, trigger_reason, C_RESET);
             log_guard_event(&warn_log, silent);
 
             match auto_switch_account_and_model(true) {
                 Ok(res) => {
-                    if res.account_switched || res.model_switched {
+                    if res.account_switched {
                         let success_log = format!(
-                            "{}[成功] 智能调配完成！活动账号已平滑切至: {}{} | 默认模型: {}{} ({}) | 已热重载恢复 {} 个 agy 终端会话{}",
+                            "{}[成功] 智能切号完成！活动账号已平滑切至: {}{} | 保持默认模型: {}{} ({}) | 已热重载恢复 {} 个 agy 终端会话{}",
                             C_GREEN, res.account_email, C_RESET, C_CYAN, res.active_model, res.model_reason, res.reloaded_sessions, C_RESET
                         );
                         log_guard_event(&success_log, silent);
                         send_desktop_notification(
-                            "Antigravity 配额自动调配",
-                            &format!("原配额告急，已自动调配完成！\n账号: {}\n模型: {}\n已恢复 {} 个终端会话", res.account_email, res.active_model, res.reloaded_sessions),
+                            "Antigravity 配额自动切号",
+                            &format!("原账号配额告急，已自动切号！\n账号: {}\n模型保持: {}\n已恢复 {} 个终端会话", res.account_email, res.active_model, res.reloaded_sessions),
                         );
                         last_switch_time = Some(Instant::now());
                         cached_candidates.clear();
                     } else {
-                        let exhausted_log = format!("{}[警告] 账号池中无其他更高额度的可用账号或模型，全部耗尽或受限{}", C_YELLOW, C_RESET);
+                        let exhausted_log = format!("{}[警告] 账号池中所有账号在当前模型 [{}] 下的配额均已耗尽或受限{}", C_YELLOW, cur_model, C_RESET);
                         log_guard_event(&exhausted_log, silent);
                         send_desktop_notification(
                             "Antigravity 配额告警",
-                            "账号池中所有账号/模型配额均已耗尽，请等待最近窗口刷新！",
+                            &format!("账号池中所有账号在模型 [{}] 下的配额均已耗尽，请等待最近窗口刷新！", cur_model),
                         );
                     }
                 }
                 Err(e) => {
-                    let err_msg = format!("{}[错误] 自动调配失败: {}{}", C_RED, e, C_RESET);
+                    let err_msg = format!("{}[错误] 自动切号失败: {}{}", C_RED, e, C_RESET);
                     log_guard_event(&err_msg, silent);
                 }
             }
@@ -2940,10 +3168,10 @@ fn run_cli_menu() {
         println!(" {}[1]{} 查看当前账号额度详情 (Detailed Quota)", C_CYAN, C_RESET);
         println!(" {}[2]{} 查看所有账号全局大盘 (All Accounts Overview)", C_CYAN, C_RESET);
         println!(" {}[3]{} 切换当前活动账号 (Switch Account - 交互选择 / 序号 / 邮箱)", C_CYAN, C_RESET);
-        println!(" {}[4]{} 智能切至最高额度账号与模型 (Auto-Switch Account & Claude/Gemini Model)", C_CYAN, C_RESET);
+        println!(" {}[4]{} 智能切至当前模型最高额度账号 (Auto-Switch Account in Model Quota Pool)", C_CYAN, C_RESET);
         println!(" {}[A]{} 后台自动调配守护服务 (Auto-Guard Daemon - 监控/自动切号/通知)", C_GREEN, C_RESET);
         println!(" {}[P]{} 一键唤醒全账号池沉睡周额度时钟 (Pre-warm Weekly Clocks - 提前激活7天倒计时)", C_MAGENTA, C_RESET);
-        println!(" {}[M]{} 切换全局默认模型 (Switch Default Model: Claude / Gemini / Auto)", C_BLUE, C_RESET);
+        println!(" {}[M]{} 切换全局默认模型 (Switch Default Model: Claude Opus/Sonnet / Gemini)", C_BLUE, C_RESET);
         println!(" {}[5]{} 保存当前 agy 账号至账号池 (Save Active agy Account)", C_CYAN, C_RESET);
         println!(" {}[6]{} 添加新账号到账号池 (Add New Account - 浏览器授权 / Token)", C_CYAN, C_RESET);
         println!(" {}[7]{} 从账号池移除账号 (Remove Account)", C_CYAN, C_RESET);
@@ -3043,20 +3271,23 @@ fn main() {
                 return;
             }
             "auto" | "best" => {
-                println!("\n[*] 正在计算各账号有效短板容量与最优模型配额...");
+                let cur_model = get_active_model_setting();
+                println!("\n[*] 正在计算全局账号在当前模型 [{}] 下的算力排位...", cur_model);
+                let (rows, current_id, _) = fetch_all_accounts_data();
+                let (slots, best_slot) = generate_matrix_slots(&rows, current_id.as_deref(), &cur_model);
+
+                print_matrix_slots_table(&slots, current_id.as_deref(), &cur_model, best_slot.as_ref());
+                println!();
+
                 match auto_switch_account_and_model(false) {
                     Ok(res) => {
                         if res.account_switched {
-                            println!("[+] 账号切换成功！已切至最优配额账号: {}", res.account_email);
+                            println!("[+] 账号切换成功！已切至最优算力账号: {}", res.account_email);
                         } else {
-                            println!("[*] 当前活动账号 ({}) 即为最高额度账号", res.account_email);
+                            println!("[*] 当前活动账号 ({}) 即为最优算力账号", res.account_email);
                         }
 
-                        if res.model_switched {
-                            println!("[+] 智能模型联动: 检测到 {}，已自动切换为: {}", res.model_reason, res.active_model);
-                        } else {
-                            println!("[*] 当前默认模型: {} ({})", res.active_model, res.model_reason);
-                        }
+                        println!("[*] 当前默认模型: 保持 {}", res.active_model);
 
                         if res.reloaded_sessions > 0 {
                             println!("[通过] 成功重启并恢复了 {} 个 agy 终端窗口！", res.reloaded_sessions);
@@ -3086,17 +3317,8 @@ fn main() {
                             match switch_account_by_id(target_id) {
                                 Ok((email, count)) => {
                                     println!("[+] 切换成功！当前活动账号已切为: {}", email);
-                                    let (rows, _, _) = fetch_all_accounts_data();
-                                    if let Some(target_row) = rows.iter().find(|r| r.acc.id == *target_id) {
-                                        if let Some(q) = &target_row.parsed {
-                                            let cur_m = get_active_model_setting();
-                                            let (rec_m, reason) = evaluate_best_model_for_quota(q);
-                                            if rec_m != cur_m {
-                                                let _ = set_active_model_setting(rec_m);
-                                                println!("[+] 智能模型联动: 检测到 {}，已自动适配模型为: {}", reason, rec_m);
-                                            }
-                                        }
-                                    }
+                                    let cur_m = get_active_model_setting();
+                                    println!("[*] 当前默认模型保持为: {}", cur_m);
                                     if count > 0 {
                                         println!("[通过] 成功重启并恢复了 {} 个 agy 终端窗口！", count);
                                     }
@@ -3110,17 +3332,8 @@ fn main() {
                         match switch_account_by_id(&acc.id) {
                             Ok((email, count)) => {
                                 println!("[+] 切换成功！当前活动账号已切为: {}", email);
-                                let (rows, _, _) = fetch_all_accounts_data();
-                                if let Some(target_row) = rows.iter().find(|r| r.acc.id == acc.id) {
-                                    if let Some(q) = &target_row.parsed {
-                                        let cur_m = get_active_model_setting();
-                                        let (rec_m, reason) = evaluate_best_model_for_quota(q);
-                                        if rec_m != cur_m {
-                                            let _ = set_active_model_setting(rec_m);
-                                            println!("[+] 智能模型联动: 检测到 {}，已自动适配模型为: {}", reason, rec_m);
-                                        }
-                                    }
-                                }
+                                let cur_m = get_active_model_setting();
+                                println!("[*] 当前默认模型保持为: {}", cur_m);
                                 if count > 0 {
                                     println!("[通过] 成功重启并恢复了 {} 个 agy 终端窗口！", count);
                                 }
@@ -3146,17 +3359,8 @@ fn main() {
                             match switch_account_by_id(target_id) {
                                 Ok((email, count)) => {
                                     println!("[+] 切换成功！当前活动账号已切为: {}", email);
-                                    let (rows, _, _) = fetch_all_accounts_data();
-                                    if let Some(target_row) = rows.iter().find(|r| r.acc.id == *target_id) {
-                                        if let Some(q) = &target_row.parsed {
-                                            let cur_m = get_active_model_setting();
-                                            let (rec_m, reason) = evaluate_best_model_for_quota(q);
-                                            if rec_m != cur_m {
-                                                let _ = set_active_model_setting(rec_m);
-                                                println!("[+] 智能模型联动: 检测到 {}，已自动适配模型为: {}", reason, rec_m);
-                                            }
-                                        }
-                                    }
+                                    let cur_m = get_active_model_setting();
+                                    println!("[*] 当前默认模型保持为: {}", cur_m);
                                     if count > 0 {
                                         println!("[通过] 成功重启并恢复了 {} 个 agy 终端窗口！", count);
                                     }
@@ -3225,22 +3429,9 @@ fn main() {
                 let sub2 = args.get(2).map(|s| s.as_str()).unwrap_or("");
                 match sub2 {
                     "auto" => {
-                        let (rows, current_id, _) = fetch_all_accounts_data();
-                        let cur_parsed = rows
-                            .iter()
-                            .find(|r| current_id.as_deref() == Some(&r.acc.id))
-                            .and_then(|r| r.parsed.as_ref());
-                        if let Some(q) = cur_parsed {
-                            let (best_m, reason) = evaluate_best_model_for_quota(q);
-                            let _ = set_active_model_setting(best_m);
-                            println!("[+] 智能推荐切换完成！原因: {} -> 默认模型已切换为: {}", reason, best_m);
-                            let cnt = reload_all_active_agy_sessions();
-                            if cnt > 0 {
-                                println!("[通过] 成功重启并恢复了 {} 个 agy 终端窗口！", cnt);
-                            }
-                        } else {
-                            println!("[-] 获取当前配额失败，未做修改");
-                        }
+                        let cur_m = get_active_model_setting();
+                        println!("[提示] 模型自动切换已停用。当前默认模型保持为: {}", cur_m);
+                        println!("系统将在该模型的账号配额池中自动切换账号。可用命令切换默认模型: model opus / model sonnet / model flash / model pro");
                     }
                     "claude" | "sonnet" => {
                         let _ = set_active_model_setting(MODEL_CLAUDE_SONNET);
@@ -3287,14 +3478,13 @@ fn main() {
                 println!("  AGY多账号配额中心.exe usage      # 直接输出当前各账号配额对比表");
                 println!("  AGY多账号配额中心.exe accounts   # 列出所有账号");
                 println!("  AGY多账号配额中心.exe switch <序号/邮箱> # 切换活动账号并自动热重载终端");
-                println!("  AGY多账号配额中心.exe auto       # 自动切至最高额度账号，Claude充沛时联动切至Claude Sonnet");
+                println!("  AGY多账号配额中心.exe auto       # 自动切至当前模型下最高额度账号并自动热重载终端");
                 println!("  AGY多账号配额中心.exe guard      # 前台启动守护监听 (按 Ctrl+C 退出)");
                 println!("  AGY多账号配额中心.exe guard --silent # 后台静默启动守护服务");
                 println!("  AGY多账号配额中心.exe guard --status # 查看守护服务运行状态");
                 println!("  AGY多账号配额中心.exe guard --stop   # 停止守护服务");
                 println!("  AGY多账号配额中心.exe prewarm    # 一键唤醒全账号池沉睡周额度时钟 (提前激活7天倒计时)");
-                println!("  AGY多账号配额中心.exe model      # 切换全局默认模型 (Claude / Gemini)");
-                println!("  AGY多账号配额中心.exe model auto # 根据当前账号配额智能匹配最佳模型 (Claude / Gemini)");
+                println!("  AGY多账号配额中心.exe model <opus/sonnet/flash/pro> # 切换全局默认模型 (Claude / Gemini)");
                 println!("  AGY多账号配额中心.exe reload     # 手动触发所有运行中 agy 终端会话的热重载");
                 println!("  AGY多账号配额中心.exe save       # 保存当前账号快照");
                 return;
