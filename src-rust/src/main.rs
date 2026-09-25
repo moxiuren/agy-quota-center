@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
+#[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
@@ -13,6 +14,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use unicode_width::UnicodeWidthStr;
 
+#[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const OAUTH_CLIENT_ID: &str = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
 const OAUTH_CLIENT_SECRET: &str = concat!("GOCSPX-", "K58FWR486LdLJ1mLB8sXC4z6qDAf");
@@ -31,153 +33,164 @@ const C_BLUE: &str = "\x1B[94m";
 const C_MAGENTA: &str = "\x1B[95m";
 const C_WHITE: &str = "\x1B[97m";
 
-// Windows Credential Manager API
-#[repr(C)]
-struct CREDENTIALW {
-    flags: u32,
-    cred_type: u32,
-    target_name: *mut u16,
-    comment: *mut u16,
-    last_written: [u32; 2],
-    credential_blob_size: u32,
-    credential_blob: *mut u8,
-    persist: u32,
-    attribute_count: u32,
-    attributes: *mut std::ffi::c_void,
-    target_alias: *mut u16,
-    user_name: *mut u16,
+// =============================================================================
+// Windows-only: Win32 FFI 结构体、常量与外部函数声明
+// =============================================================================
+#[cfg(target_os = "windows")]
+mod win32 {
+    #[repr(C)]
+    pub struct CREDENTIALW {
+        pub flags: u32,
+        pub cred_type: u32,
+        pub target_name: *mut u16,
+        pub comment: *mut u16,
+        pub last_written: [u32; 2],
+        pub credential_blob_size: u32,
+        pub credential_blob: *mut u8,
+        pub persist: u32,
+        pub attribute_count: u32,
+        pub attributes: *mut std::ffi::c_void,
+        pub target_alias: *mut u16,
+        pub user_name: *mut u16,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct KEY_EVENT_RECORD {
+        pub b_key_down: i32,
+        pub w_repeat_count: u16,
+        pub w_virtual_key_code: u16,
+        pub w_virtual_scan_code: u16,
+        pub u_char: u16,
+        pub dw_control_key_state: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct INPUT_RECORD {
+        pub event_type: u16,
+        pub _pad: u16,
+        pub key_event: KEY_EVENT_RECORD,
+    }
+
+    #[repr(C)]
+    pub struct PROCESSENTRY32W {
+        pub dw_size: u32,
+        pub cnt_usage: u32,
+        pub th32_process_id: u32,
+        pub th32_default_heap_id: usize,
+        pub th32_module_id: u32,
+        pub cnt_threads: u32,
+        pub th32_parent_process_id: u32,
+        pub pc_pri_class_base: i32,
+        pub dw_flags: u32,
+        pub sz_exe_file: [u16; 260],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct COORD {
+        pub x: i16,
+        pub y: i16,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct SMALL_RECT {
+        pub left: i16,
+        pub top: i16,
+        pub right: i16,
+        pub bottom: i16,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct CONSOLE_SCREEN_BUFFER_INFO {
+        pub dw_size: COORD,
+        pub dw_cursor_position: COORD,
+        pub w_attributes: u16,
+        pub sr_window: SMALL_RECT,
+        pub dw_maximum_window_size: COORD,
+    }
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        pub fn CredReadW(target: *const u16, cred_type: u32, flags: u32, cred: *mut *mut CREDENTIALW) -> i32;
+        pub fn CredWriteW(cred: *const CREDENTIALW, flags: u32) -> i32;
+        pub fn CredFree(buffer: *mut std::ffi::c_void);
+    }
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        pub fn VkKeyScanW(ch: u16) -> i16;
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        pub fn SetConsoleOutputCP(wCodePageID: u32) -> i32;
+        pub fn SetConsoleCP(wCodePageID: u32) -> i32;
+        pub fn GetStdHandle(nStdHandle: u32) -> *mut std::ffi::c_void;
+        pub fn GetConsoleMode(hConsoleHandle: *mut std::ffi::c_void, lpMode: *mut u32) -> i32;
+        pub fn SetConsoleMode(hConsoleHandle: *mut std::ffi::c_void, dwMode: u32) -> i32;
+        pub fn FreeConsole() -> i32;
+        pub fn AttachConsole(dwProcessId: u32) -> i32;
+        pub fn CreateFileW(
+            lpFileName: *const u16,
+            dwDesiredAccess: u32,
+            dwShareMode: u32,
+            lpSecurityAttributes: *mut std::ffi::c_void,
+            dwCreationDisposition: u32,
+            dwFlagsAndAttributes: u32,
+            hTemplateFile: *mut std::ffi::c_void,
+        ) -> *mut std::ffi::c_void;
+        pub fn GetConsoleScreenBufferInfo(
+            hConsoleOutput: *mut std::ffi::c_void,
+            lpConsoleScreenBufferInfo: *mut CONSOLE_SCREEN_BUFFER_INFO,
+        ) -> i32;
+        pub fn ReadConsoleOutputCharacterW(
+            hConsoleOutput: *mut std::ffi::c_void,
+            lpCharacter: *mut u16,
+            nLength: u32,
+            dwReadCoord: COORD,
+            lpNumberOfCharsRead: *mut u32,
+        ) -> i32;
+        pub fn WriteConsoleInputW(
+            hConsoleInput: *mut std::ffi::c_void,
+            lpBuffer: *const INPUT_RECORD,
+            nLength: u32,
+            lpNumberOfEventsWritten: *mut u32,
+        ) -> i32;
+        pub fn CreateToolhelp32Snapshot(dwFlags: u32, th32ProcessID: u32) -> *mut std::ffi::c_void;
+        pub fn Process32FirstW(hSnapshot: *mut std::ffi::c_void, lppe: *mut PROCESSENTRY32W) -> i32;
+        pub fn Process32NextW(hSnapshot: *mut std::ffi::c_void, lppe: *mut PROCESSENTRY32W) -> i32;
+        pub fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+        pub fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> *mut std::ffi::c_void;
+        pub fn TerminateProcess(hProcess: *mut std::ffi::c_void, uExitCode: u32) -> i32;
+        pub fn WaitForSingleObject(hHandle: *mut std::ffi::c_void, dwMilliseconds: u32) -> u32;
+        pub fn GetCurrentProcessId() -> u32;
+    }
+
+    pub const STD_INPUT_HANDLE: u32 = 0xFFFFFFF6;
+    pub const STD_OUTPUT_HANDLE: u32 = 0xFFFFFFF5;
+    pub const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+    pub const TH32CS_SNAPPROCESS: u32 = 0x00000002;
+    pub const SYNCHRONIZE: u32 = 0x00100000;
+    pub const PROCESS_TERMINATE: u32 = 0x0001;
+    pub const WAIT_OBJECT_0: u32 = 0;
+    pub const DETACHED_PROCESS: u32 = 0x00000008;
+    pub const GENERIC_READ: u32 = 0x80000000;
+    pub const GENERIC_WRITE: u32 = 0x40000000;
+    pub const FILE_SHARE_READ: u32 = 0x00000001;
+    pub const FILE_SHARE_WRITE: u32 = 0x00000002;
+    pub const OPEN_EXISTING: u32 = 3;
 }
+#[cfg(target_os = "windows")]
+use win32::*;
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct KEY_EVENT_RECORD {
-    b_key_down: i32,
-    w_repeat_count: u16,
-    w_virtual_key_code: u16,
-    w_virtual_scan_code: u16,
-    u_char: u16,
-    dw_control_key_state: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct INPUT_RECORD {
-    event_type: u16,
-    _pad: u16,
-    key_event: KEY_EVENT_RECORD,
-}
-
-#[repr(C)]
-struct PROCESSENTRY32W {
-    dw_size: u32,
-    cnt_usage: u32,
-    th32_process_id: u32,
-    th32_default_heap_id: usize,
-    th32_module_id: u32,
-    cnt_threads: u32,
-    th32_parent_process_id: u32,
-    pc_pri_class_base: i32,
-    dw_flags: u32,
-    sz_exe_file: [u16; 260],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct COORD {
-    x: i16,
-    y: i16,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct SMALL_RECT {
-    left: i16,
-    top: i16,
-    right: i16,
-    bottom: i16,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct CONSOLE_SCREEN_BUFFER_INFO {
-    dw_size: COORD,
-    dw_cursor_position: COORD,
-    w_attributes: u16,
-    sr_window: SMALL_RECT,
-    dw_maximum_window_size: COORD,
-}
-
-#[link(name = "advapi32")]
-unsafe extern "system" {
-    fn CredReadW(target: *const u16, cred_type: u32, flags: u32, cred: *mut *mut CREDENTIALW) -> i32;
-    fn CredWriteW(cred: *const CREDENTIALW, flags: u32) -> i32;
-    fn CredFree(buffer: *mut std::ffi::c_void);
-}
-
-#[link(name = "user32")]
-unsafe extern "system" {
-    fn VkKeyScanW(ch: u16) -> i16;
-}
-
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    fn SetConsoleOutputCP(wCodePageID: u32) -> i32;
-    fn SetConsoleCP(wCodePageID: u32) -> i32;
-    fn GetStdHandle(nStdHandle: u32) -> *mut std::ffi::c_void;
-    fn GetConsoleMode(hConsoleHandle: *mut std::ffi::c_void, lpMode: *mut u32) -> i32;
-    fn SetConsoleMode(hConsoleHandle: *mut std::ffi::c_void, dwMode: u32) -> i32;
-    fn FreeConsole() -> i32;
-    fn AttachConsole(dwProcessId: u32) -> i32;
-    fn CreateFileW(
-        lpFileName: *const u16,
-        dwDesiredAccess: u32,
-        dwShareMode: u32,
-        lpSecurityAttributes: *mut std::ffi::c_void,
-        dwCreationDisposition: u32,
-        dwFlagsAndAttributes: u32,
-        hTemplateFile: *mut std::ffi::c_void,
-    ) -> *mut std::ffi::c_void;
-    fn GetConsoleScreenBufferInfo(
-        hConsoleOutput: *mut std::ffi::c_void,
-        lpConsoleScreenBufferInfo: *mut CONSOLE_SCREEN_BUFFER_INFO,
-    ) -> i32;
-    fn ReadConsoleOutputCharacterW(
-        hConsoleOutput: *mut std::ffi::c_void,
-        lpCharacter: *mut u16,
-        nLength: u32,
-        dwReadCoord: COORD,
-        lpNumberOfCharsRead: *mut u32,
-    ) -> i32;
-    fn WriteConsoleInputW(
-        hConsoleInput: *mut std::ffi::c_void,
-        lpBuffer: *const INPUT_RECORD,
-        nLength: u32,
-        lpNumberOfEventsWritten: *mut u32,
-    ) -> i32;
-    fn CreateToolhelp32Snapshot(dwFlags: u32, th32ProcessID: u32) -> *mut std::ffi::c_void;
-    fn Process32FirstW(hSnapshot: *mut std::ffi::c_void, lppe: *mut PROCESSENTRY32W) -> i32;
-    fn Process32NextW(hSnapshot: *mut std::ffi::c_void, lppe: *mut PROCESSENTRY32W) -> i32;
-    fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
-    fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> *mut std::ffi::c_void;
-    fn TerminateProcess(hProcess: *mut std::ffi::c_void, uExitCode: u32) -> i32;
-    fn WaitForSingleObject(hHandle: *mut std::ffi::c_void, dwMilliseconds: u32) -> u32;
-    fn GetCurrentProcessId() -> u32;
-}
-
-const STD_INPUT_HANDLE: u32 = 0xFFFFFFF6; // -10
-const STD_OUTPUT_HANDLE: u32 = 0xFFFFFFF5; // -11
-const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
-const TH32CS_SNAPPROCESS: u32 = 0x00000002;
-const SYNCHRONIZE: u32 = 0x00100000;
-const PROCESS_TERMINATE: u32 = 0x0001;
-const WAIT_OBJECT_0: u32 = 0;
-const DETACHED_PROCESS: u32 = 0x00000008;
-const GENERIC_READ: u32 = 0x80000000;
-const GENERIC_WRITE: u32 = 0x40000000;
-const FILE_SHARE_READ: u32 = 0x00000001;
-const FILE_SHARE_WRITE: u32 = 0x00000002;
-const OPEN_EXISTING: u32 = 3;
-
+// =============================================================================
+// Windows-only: 控制台注入、按键模拟、进程枚举与会话热重载
+// =============================================================================
+#[cfg(target_os = "windows")]
 unsafe fn make_key_record(vk: u16, ch: u16, ctrl: u32, down: bool) -> INPUT_RECORD {
     let mut rec: INPUT_RECORD = std::mem::zeroed();
     rec.event_type = 1;
@@ -189,6 +202,7 @@ unsafe fn make_key_record(vk: u16, ch: u16, ctrl: u32, down: bool) -> INPUT_RECO
     rec
 }
 
+#[cfg(target_os = "windows")]
 unsafe fn open_console_input() -> (*mut std::ffi::c_void, bool) {
     let conin_name = to_wide("CONIN$");
     let h = CreateFileW(
@@ -207,11 +221,13 @@ unsafe fn open_console_input() -> (*mut std::ffi::c_void, bool) {
     }
 }
 
+#[cfg(target_os = "windows")]
 unsafe fn inject_keys_to_console(con_handle: *mut std::ffi::c_void, records: &[INPUT_RECORD]) -> bool {
     let mut written = 0u32;
     WriteConsoleInputW(con_handle, records.as_ptr(), records.len() as u32, &mut written) != 0
 }
 
+#[cfg(target_os = "windows")]
 unsafe fn send_string_to_console(h_in: *mut std::ffi::c_void, text: &str) {
     let mut records: Vec<INPUT_RECORD> = Vec::new();
     for ch in text.chars() {
@@ -274,6 +290,7 @@ fn get_conversation_id_from_log(agy_pid: u32) -> Option<String> {
     None
 }
 
+#[cfg(target_os = "windows")]
 unsafe fn run_worker_inject(target_pid: u32, action: &str) -> i32 {
     FreeConsole();
     if AttachConsole(target_pid) == 0 {
@@ -368,6 +385,7 @@ unsafe fn run_worker_inject(target_pid: u32, action: &str) -> i32 {
     0
 }
 
+#[cfg(target_os = "windows")]
 fn get_all_agy_processes() -> Vec<(u32, u32)> {
     let mut agy_list = Vec::new();
     let mut parent_map: HashMap<u32, u32> = HashMap::new();
@@ -418,6 +436,7 @@ fn get_all_agy_processes() -> Vec<(u32, u32)> {
     agy_list.into_iter().filter(|(pid, _)| *pid != my_pid && !ancestors.contains(pid)).collect()
 }
 
+#[cfg(target_os = "windows")]
 fn reload_all_active_agy_sessions() -> usize {
     let procs = get_all_agy_processes();
     if procs.is_empty() {
@@ -503,11 +522,116 @@ fn reload_all_active_agy_sessions() -> usize {
     reloaded
 }
 
+// =============================================================================
+// macOS / Linux: 进程枚举与会话热重载（降级实现）
+// macOS 终端无 Win32 AttachConsole 等价物，无法向其他终端注入按键，
+// 因此采用 SIGTERM 优雅终止 + 提示用户手动恢复的降级策略。
+// agy 的对话与工具调用已实时持久化，终止不会丢失会话历史。
+// =============================================================================
+#[cfg(not(target_os = "windows"))]
+fn get_all_agy_processes() -> Vec<(u32, u32)> {
+    let mut agy_list: Vec<(u32, u32)> = Vec::new();
+    let mut parent_map: HashMap<u32, u32> = HashMap::new();
+    let my_pid = std::process::id();
+
+    let out = Command::new("ps")
+        .args(["-ax", "-o", "pid=,ppid=,comm="])
+        .output();
+    if let Ok(out) = out {
+        if out.status.success() {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() < 3 {
+                    continue;
+                }
+                if let (Ok(pid), Ok(ppid)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
+                    parent_map.insert(pid, ppid);
+                    let comm = parts[2].rsplit('/').next().unwrap_or(parts[2]);
+                    if comm == "agy" {
+                        agy_list.push((pid, ppid));
+                    }
+                }
+            }
+        }
+    }
+
+    // 收集当前进程的所有祖先 PID，防止自我终止调用链
+    let mut ancestors = HashSet::new();
+    let mut cur = my_pid;
+    while let Some(&p) = parent_map.get(&cur) {
+        if p == 0 || p == cur || ancestors.contains(&p) {
+            break;
+        }
+        ancestors.insert(p);
+        cur = p;
+    }
+
+    agy_list.into_iter().filter(|(pid, _)| *pid != my_pid && !ancestors.contains(pid)).collect()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn reload_all_active_agy_sessions() -> usize {
+    let procs = get_all_agy_processes();
+    if procs.is_empty() {
+        return 0;
+    }
+
+    println!("\n{}[*] 检测到 {} 个运行中的 agy 终端会话，正在下发优雅终止（macOS 降级模式）...{}", C_DIM, procs.len(), C_RESET);
+    println!("{}[说明] macOS 终端不支持跨进程按键注入，凭据已切换，请在各终端内按 Ctrl+C 后重新运行 agy 以加载新账号。{}", C_DIM, C_RESET);
+    let mut reloaded = 0;
+
+    for (agy_pid, _shell_pid) in procs {
+        // 提前解析其专属 Conversation ID，便于用户手动恢复时参考
+        let log_conv_id = get_conversation_id_from_log(agy_pid);
+        // 1. 发送 SIGTERM 优雅终止（kill 默认信号 15）
+        let term_res = Command::new("kill")
+            .args(["-TERM", &agy_pid.to_string()])
+            .status();
+
+        // 2. 等待最多 1.2 秒退出
+        let mut exited = term_res.map(|s| s.success()).unwrap_or(false);
+        let start = Instant::now();
+        while !exited && start.elapsed() < Duration::from_millis(1200) {
+            std::thread::sleep(Duration::from_millis(100));
+            // kill -0 探测进程是否仍存在
+            let probe = Command::new("kill")
+                .args(["-0", &agy_pid.to_string()])
+                .status();
+            if probe.map(|s| !s.success()).unwrap_or(true) {
+                exited = true;
+            }
+        }
+
+        if !exited {
+            // 兜底 SIGKILL（agy 数据已实时持久化，强杀不丢历史）
+            let _ = Command::new("kill")
+                .args(["-KILL", &agy_pid.to_string()])
+                .status();
+            exited = true;
+        }
+
+        if exited {
+            reloaded += 1;
+            if let Some(id) = &log_conv_id {
+                println!("{}[+] 会话 (PID: {}) 已优雅终止，手动恢复命令参考: agy --conversation={} {}", C_GREEN, agy_pid, id, C_RESET);
+            } else {
+                println!("{}[+] 会话 (PID: {}) 已优雅终止，请手动重启 agy 恢复会话。{}", C_GREEN, agy_pid, C_RESET);
+            }
+        } else {
+            println!("{}[警告] 会话 (PID: {}) 终止失败，已跳过。{}", C_YELLOW, agy_pid, C_RESET);
+        }
+    }
+
+    reloaded
+}
+
+#[cfg(target_os = "windows")]
 fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 fn init_console() {
+    #[cfg(target_os = "windows")]
     unsafe {
         SetConsoleOutputCP(65001);
         SetConsoleCP(65001);
@@ -517,6 +641,7 @@ fn init_console() {
             SetConsoleMode(h_out, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
         }
     }
+    // macOS/Linux: 终端天然支持 UTF-8 和 ANSI，无需额外初始化
 }
 
 fn clear_screen() {
@@ -578,6 +703,7 @@ fn make_bar(fraction: f64, width: usize) -> String {
 }
 
 // Keyring I/O
+#[cfg(target_os = "windows")]
 fn read_keyring() -> Option<Value> {
     let target = to_wide("gemini:antigravity");
     let mut cred_ptr: *mut CREDENTIALW = std::ptr::null_mut();
@@ -593,6 +719,30 @@ fn read_keyring() -> Option<Value> {
     None
 }
 
+#[cfg(not(target_os = "windows"))]
+fn read_keyring() -> Option<Value> {
+    // macOS: 优先从 macOS Keychain 读取，回退到文件
+    let out = Command::new("security")
+        .args(["find-generic-password", "-s", "gemini:antigravity", "-a", "antigravity", "-w"])
+        .output()
+        .ok()?;
+    if out.status.success() {
+        let json_str = String::from_utf8_lossy(&out.stdout);
+        if let Ok(val) = serde_json::from_str::<Value>(json_str.trim()) {
+            return Some(val);
+        }
+    }
+    // 回退：从 ~/.gemini/antigravity-cli/antigravity-oauth-token 读取
+    let fallback = get_gemini_dir().join("antigravity-cli").join("antigravity-oauth-token");
+    if fallback.exists() {
+        if let Ok(content) = fs::read_to_string(&fallback) {
+            return serde_json::from_str(&content).ok();
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
 fn write_keyring(data: &Value) -> bool {
     let json_bytes = match serde_json::to_vec(data) {
         Ok(b) => b,
@@ -618,6 +768,32 @@ fn write_keyring(data: &Value) -> bool {
     };
 
     unsafe { CredWriteW(&cred, 0) != 0 }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn write_keyring(data: &Value) -> bool {
+    let json_str = match serde_json::to_string(data) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    // macOS: 写入 Keychain（先删后加，避免重复）
+    let _ = Command::new("security")
+        .args(["delete-generic-password", "-s", "gemini:antigravity", "-a", "antigravity"])
+        .output();
+    let res = Command::new("security")
+        .args(["add-generic-password", "-s", "gemini:antigravity", "-a", "antigravity", "-w", &json_str, "-U"])
+        .output();
+    if let Ok(out) = res {
+        if out.status.success() {
+            return true;
+        }
+    }
+    // 回退：写入文件
+    let fallback = get_gemini_dir().join("antigravity-cli").join("antigravity-oauth-token");
+    if let Some(parent) = fallback.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    fs::write(fallback, &json_str).is_ok()
 }
 
 fn get_gemini_dir() -> PathBuf {
@@ -719,7 +895,8 @@ fn save_account(acc: &AccountDetail) {
 
 // Native curl helper
 fn curl_post_json(url: &str, headers: &[(&str, &str)], body: &str) -> Result<String, String> {
-    let mut cmd = Command::new("curl.exe");
+    let curl_bin = if cfg!(target_os = "windows") { "curl.exe" } else { "curl" };
+    let mut cmd = Command::new(curl_bin);
     cmd.args(["-s", "-m", "15", "-X", "POST", url]);
     for (k, v) in headers {
         cmd.args(["-H", &format!("{}: {}", k, v)]);
@@ -727,6 +904,7 @@ fn curl_post_json(url: &str, headers: &[(&str, &str)], body: &str) -> Result<Str
     if !body.is_empty() {
         cmd.args(["-d", body]);
     }
+    #[cfg(target_os = "windows")]
     cmd.creation_flags(CREATE_NO_WINDOW);
     let out = cmd.output().map_err(|e| e.to_string())?;
     if out.status.success() {
@@ -737,11 +915,13 @@ fn curl_post_json(url: &str, headers: &[(&str, &str)], body: &str) -> Result<Str
 }
 
 fn curl_get_json(url: &str, headers: &[(&str, &str)]) -> Result<String, String> {
-    let mut cmd = Command::new("curl.exe");
+    let curl_bin = if cfg!(target_os = "windows") { "curl.exe" } else { "curl" };
+    let mut cmd = Command::new(curl_bin);
     cmd.args(["-s", "-m", "15", url]);
     for (k, v) in headers {
         cmd.args(["-H", &format!("{}: {}", k, v)]);
     }
+    #[cfg(target_os = "windows")]
     cmd.creation_flags(CREATE_NO_WINDOW);
     let out = cmd.output().map_err(|e| e.to_string())?;
     if out.status.success() {
@@ -1273,7 +1453,7 @@ fn switch_account_credentials_only(target_id: &str) -> Result<String, String> {
     }
 
     if !write_keyring(&cred_obj) {
-        return Err("写入 Windows 凭据管理器失败".to_string());
+        return Err("写入系统凭据存储失败".to_string());
     }
 
     let ga_file = get_gemini_dir().join("google_accounts.json");
@@ -1342,8 +1522,10 @@ fn prewarm_account_clock(target_id: &str, model: &str) -> Result<String, String>
     let target_email = switch_account_credentials_only(target_id)?;
 
     // 2. 调用 agy 隐藏进程执行最小 ping 请求 (仅 1 turn, 消耗 <0.2%)
-    let mut cmd = Command::new("agy.exe");
+    let agy_bin = if cfg!(target_os = "windows") { "agy.exe" } else { "agy" };
+    let mut cmd = Command::new(agy_bin);
     cmd.args(["--model", model, "-p", "ping", "--output-format", "json"]);
+    #[cfg(target_os = "windows")]
     cmd.creation_flags(CREATE_NO_WINDOW);
     let out_res = cmd.output();
 
@@ -1358,7 +1540,7 @@ fn prewarm_account_clock(target_id: &str, model: &str) -> Result<String, String>
             let err = String::from_utf8_lossy(&out.stderr);
             Err(format!("预热响应异常: {}", err))
         }
-        Err(e) => Err(format!("调用 agy.exe 失败: {}", e)),
+        Err(e) => Err(format!("调用 agy 失败: {}", e)),
     }
 }
 
@@ -2214,6 +2396,7 @@ fn get_guard_log_path() -> PathBuf {
     get_gemini_dir().join("agy_guard.log")
 }
 
+#[cfg(target_os = "windows")]
 fn is_process_running(pid: u32) -> bool {
     unsafe {
         let h = OpenProcess(SYNCHRONIZE, 0, pid);
@@ -2225,6 +2408,16 @@ fn is_process_running(pid: u32) -> bool {
             false
         }
     }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_process_running(pid: u32) -> bool {
+    // macOS/Linux: kill -0 探测进程是否存在（不发送实际信号）
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 fn read_guard_pid() -> Option<u32> {
@@ -2250,6 +2443,7 @@ fn remove_guard_pid() {
     let _ = fs::remove_file(get_guard_pid_path());
 }
 
+#[cfg(target_os = "windows")]
 fn stop_guard_daemon() -> bool {
     if let Some(pid) = read_guard_pid() {
         log_guard_event(&format!("[停止] 收到终止指令，正在停止守护服务 (PID: {})...", pid), true);
@@ -2260,6 +2454,21 @@ fn stop_guard_daemon() -> bool {
                 CloseHandle(h);
             }
         }
+        remove_guard_pid();
+        log_guard_event("[停止] 守护服务已停止", true);
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn stop_guard_daemon() -> bool {
+    if let Some(pid) = read_guard_pid() {
+        log_guard_event(&format!("[停止] 收到终止指令，正在停止守护服务 (PID: {})...", pid), true);
+        let _ = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
         remove_guard_pid();
         log_guard_event("[停止] 守护服务已停止", true);
         true
@@ -2282,6 +2491,7 @@ fn log_guard_event(msg: &str, silent: bool) {
     }
 }
 
+#[cfg(target_os = "windows")]
 fn send_desktop_notification(title: &str, message: &str) {
     let clean_title = title.replace('\'', " ").replace('"', " ").replace('<', " ").replace('>', " ");
     let clean_msg = message.replace('\'', " ").replace('"', " ").replace('<', " ").replace('>', " ");
@@ -2295,8 +2505,26 @@ fn send_desktop_notification(title: &str, message: &str) {
         .spawn();
 }
 
+#[cfg(target_os = "macos")]
+fn send_desktop_notification(title: &str, message: &str) {
+    let clean_title = title.replace('"', " ").replace('\\', " ");
+    let clean_msg = message.replace('"', " ").replace('\\', " ").replace('\n', " ");
+    let script = format!(
+        "display notification \"{}\" with title \"{}\"",
+        clean_msg, clean_title
+    );
+    let _ = Command::new("osascript")
+        .args(["-e", &script])
+        .spawn();
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn send_desktop_notification(_title: &str, _message: &str) {
+    // 其他平台：暂不支持桌面通知，静默跳过
+}
+
 fn run_guard_daemon(silent: bool) {
-    let my_pid = unsafe { GetCurrentProcessId() };
+    let my_pid = std::process::id();
 
     if let Some(existing_pid) = read_guard_pid() {
         if existing_pid != my_pid {
@@ -2712,10 +2940,11 @@ fn option_guard_management() {
                     println!("\n{}[!] 守护服务已在运行中 (PID: {})。{}", C_YELLOW, pid_opt.unwrap(), C_RESET);
                 } else {
                     if let Ok(exe_path) = std::env::current_exe() {
-                        let spawn_res = Command::new(&exe_path)
-                            .args(["guard", "--silent"])
-                            .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
-                            .spawn();
+                        let mut bg_cmd = Command::new(&exe_path);
+                        bg_cmd.args(["guard", "--silent"]);
+                        #[cfg(target_os = "windows")]
+                        bg_cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+                        let spawn_res = bg_cmd.spawn();
                         match spawn_res {
                             Ok(child) => {
                                 println!("\n{}{}[+] 守护进程已成功在后台静默启动！(PID: {}){}", C_BOLD, C_GREEN, child.id(), C_RESET);
@@ -2817,7 +3046,7 @@ fn option_save_current_account() {
 
     let cred_opt = read_keyring();
     if cred_opt.is_none() {
-        println!("{}[-] 未在 Windows 凭据管理器中检测到活动凭据。{}", C_RED, C_RESET);
+        println!("{}[-] 未在系统凭据存储中检测到活动凭据。{}", C_RED, C_RESET);
         pause();
         return;
     }
@@ -2910,7 +3139,13 @@ async fn run_oauth_flow() -> Result<(String, String), String> {
     println!("{}如果浏览器未自动打开，请手动复制并在浏览器打开以下链接:{}", C_DIM, C_RESET);
     println!("{}\n", auth_url);
 
+    // 跨平台打开浏览器：Windows 用 rundll32，macOS 用 open，Linux 用 xdg-open
+    #[cfg(target_os = "windows")]
     let _ = Command::new("rundll32.exe").args(["url.dll,FileProtocolHandler", &auth_url]).spawn();
+    #[cfg(target_os = "macos")]
+    let _ = Command::new("open").arg(&auth_url).spawn();
+    #[cfg(target_os = "linux")]
+    let _ = Command::new("xdg-open").arg(&auth_url).spawn();
 
     println!("等待浏览器授权回调中 (等待时长约 120 秒)...");
     let mut code_found = String::new();
@@ -3260,7 +3495,8 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let subcommand = args.get(1).map(|s| s.to_lowercase()).unwrap_or_default();
 
-    // 内部工作进程注入：直接在后台附加到指定控制台并执行注入，不唤起新窗口
+    // 内部工作进程注入（仅 Windows）：直接在后台附加到指定控制台并执行注入，不唤起新窗口
+    #[cfg(target_os = "windows")]
     if subcommand == "__worker_inject" {
         if let (Some(pid_str), Some(action)) = (args.get(2), args.get(3)) {
             if let Ok(target_pid) = pid_str.parse::<u32>() {
@@ -3271,8 +3507,10 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Windows only: 双击启动且不在 Windows Terminal 内时，经由 wt.exe 重启以获得更好字体渲染
     // If double-clicked from desktop without subcommands and not yet inside Windows Terminal,
     // relaunch via Windows Terminal (wt.exe) for gorgeous typography & GPU font rendering!
+    #[cfg(target_os = "windows")]
     if subcommand.is_empty() && std::env::var("WT_SESSION").is_err() && !args.iter().any(|a| a == "--no-wt") {
         if let Ok(exe_path) = std::env::current_exe() {
             if let Ok(_) = Command::new("wt.exe")
@@ -3427,10 +3665,11 @@ fn main() {
                             return;
                         }
                         if let Ok(exe_path) = std::env::current_exe() {
-                            match Command::new(&exe_path)
-                                .args(["guard", "--silent"])
-                                .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
-                                .spawn() {
+                            let mut bg_cmd = Command::new(&exe_path);
+                            bg_cmd.args(["guard", "--silent"]);
+                            #[cfg(target_os = "windows")]
+                            bg_cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+                            match bg_cmd.spawn() {
                                 Ok(child) => println!("[+] 守护进程已成功在后台启动 (PID: {})", child.id()),
                                 Err(e) => eprintln!("[-] 启动后台守护失败: {}", e),
                             }
@@ -3510,21 +3749,22 @@ fn main() {
                 return;
             }
             "--help" | "-h" | "help" => {
-                println!("Antigravity (AGY) 多账号与配额管理中心 v2.3.0 (Rust Console)");
+                let bin_name = if cfg!(target_os = "windows") { "AGY多账号配额中心.exe" } else { "agy-quota-center" };
+                println!("Antigravity (AGY) 多账号与配额管理中心 v2.4.0 (Rust Console)");
                 println!("用法:");
-                println!("  AGY多账号配额中心.exe            # 默认打开交互式黑窗口控制台菜单");
-                println!("  AGY多账号配额中心.exe usage      # 直接输出当前各账号配额对比表");
-                println!("  AGY多账号配额中心.exe accounts   # 列出所有账号");
-                println!("  AGY多账号配额中心.exe switch <序号/邮箱> # 切换活动账号并自动热重载终端");
-                println!("  AGY多账号配额中心.exe auto       # 自动切至当前模型下最高额度账号并自动热重载终端");
-                println!("  AGY多账号配额中心.exe guard      # 前台启动守护监听 (按 Ctrl+C 退出)");
-                println!("  AGY多账号配额中心.exe guard --silent # 后台静默启动守护服务");
-                println!("  AGY多账号配额中心.exe guard --status # 查看守护服务运行状态");
-                println!("  AGY多账号配额中心.exe guard --stop   # 停止守护服务");
-                println!("  AGY多账号配额中心.exe prewarm    # 一键唤醒全账号池沉睡周额度时钟 (提前激活7天倒计时)");
-                println!("  AGY多账号配额中心.exe model <opus/sonnet/flash/pro> # 切换全局默认模型 (Claude / Gemini)");
-                println!("  AGY多账号配额中心.exe reload     # 手动触发所有运行中 agy 终端会话的热重载");
-                println!("  AGY多账号配额中心.exe save       # 保存当前账号快照");
+                println!("  {}            # 默认打开交互式控制台菜单", bin_name);
+                println!("  {} usage      # 直接输出当前各账号配额对比表", bin_name);
+                println!("  {} accounts   # 列出所有账号", bin_name);
+                println!("  {} switch <序号/邮箱> # 切换活动账号并自动热重载终端", bin_name);
+                println!("  {} auto       # 自动切至当前模型下最高额度账号并自动热重载终端", bin_name);
+                println!("  {} guard      # 前台启动守护监听 (按 Ctrl+C 退出)", bin_name);
+                println!("  {} guard --silent # 后台静默启动守护服务", bin_name);
+                println!("  {} guard --status # 查看守护服务运行状态", bin_name);
+                println!("  {} guard --stop   # 停止守护服务", bin_name);
+                println!("  {} prewarm    # 一键唤醒全账号池沉睡周额度时钟 (提前激活7天倒计时)", bin_name);
+                println!("  {} model <opus/sonnet/flash/pro> # 切换全局默认模型 (Claude / Gemini)", bin_name);
+                println!("  {} reload     # 手动触发所有运行中 agy 终端会话的热重载", bin_name);
+                println!("  {} save       # 保存当前账号快照", bin_name);
                 return;
             }
             _ => {}
