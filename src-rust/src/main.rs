@@ -2677,7 +2677,7 @@ fn option_guard_management() {
         println!(" {}[2]{} 在后台静默启动守护进程 (脱机运行, 自动弹窗通知)", C_CYAN, C_RESET);
         println!(" {}[3]{} 停止正在运行的守护进程", C_YELLOW, C_RESET);
         println!(" {}[4]{} 查看守护服务最近运行日志 (最新 30 行)", C_CYAN, C_RESET);
-        println!(" {}[5]{} 立即唤醒全账号池沉睡周额度时钟 (提前激活7天倒计时)", C_MAGENTA, C_RESET);
+        println!(" {}[5]{} 自动重启所有运行中的 agy 终端会话 (Reload All Sessions)", C_CYAN, C_RESET);
         println!(" {}[0]{} 返回主菜单", C_RED, C_RESET);
         println!("{}----------------------------------------------------------------------{}", C_BOLD, C_RESET);
 
@@ -2757,9 +2757,49 @@ fn option_guard_management() {
                 pause();
             }
             "5" => {
-                prewarm_all_dormant_clocks(false);
+                clear_screen();
+                println!("\n{}{}[*] 正在扫描并热重载所有运行中的 agy 终端会话...{}", C_BOLD, C_CYAN, C_RESET);
+                let count = reload_all_active_agy_sessions();
+                if count > 0 {
+                    println!("\n{}{}[通过] 成功重启并恢复了 {} 个 agy 终端窗口！{}", C_BOLD, C_GREEN, count, C_RESET);
+                } else {
+                    println!("\n{}[信息] 当前未检测到正在运行的 agy 终端窗口。{}", C_DIM, C_RESET);
+                }
                 pause();
             }
+            "0" | "q" | "quit" | "exit" => break,
+            _ => {
+                println!("{}[!] 无效选项，请重新输入。{}", C_RED, C_RESET);
+                std::thread::sleep(Duration::from_millis(600));
+            }
+        }
+    }
+}
+
+// [5] 账号管理子菜单（保存 / 添加 / 移除 / 强制刷新凭据）
+fn option_account_management() {
+    loop {
+        clear_screen();
+        println!("\n{}{}[=== 账号管理 (Account Management) ===]{}", C_BOLD, C_CYAN, C_RESET);
+        println!(" {}[1]{} 保存当前 agy 账号至账号池 (Save Active Account)", C_CYAN, C_RESET);
+        println!(" {}[2]{} 添加新账号到账号池 (Add New Account - 浏览器授权 / Token)", C_CYAN, C_RESET);
+        println!(" {}[3]{} 从账号池移除账号 (Remove Account)", C_YELLOW, C_RESET);
+        println!(" {}[4]{} 强制刷新当前账号 OAuth 凭据 (Force Refresh Token)", C_CYAN, C_RESET);
+        println!(" {}[0]{} 返回主菜单", C_RED, C_RESET);
+        println!("{}----------------------------------------------------------------------{}", C_BOLD, C_RESET);
+
+        print!(">> 请选择操作 [0-4]: ");
+        let _ = io::stdout().flush();
+        let mut sel = String::new();
+        if io::stdin().read_line(&mut sel).is_err() {
+            break;
+        }
+
+        match sel.trim() {
+            "1" => option_save_current_account(),
+            "2" => option_add_account(),
+            "3" => option_remove_account(),
+            "4" => option_force_refresh(),
             "0" | "q" | "quit" | "exit" => break,
             _ => {
                 println!("{}[!] 无效选项，请重新输入。{}", C_RED, C_RESET);
@@ -3160,27 +3200,31 @@ fn run_cli_menu() {
         let (email, tier) = get_current_active_info();
         let cur_model = get_active_model_setting();
         println!("{}======================================================================{}", C_BOLD, C_RESET);
-        println!("{} >>> Antigravity (AGY) 多账号与配额管理中心 v2.3.0 (Rust) <<<{}", C_BOLD, C_RESET);
+        println!("{} >>> Antigravity (AGY) 多账号与配额管理中心 v2.4.0 (Rust) <<<{}", C_BOLD, C_RESET);
         println!("{}======================================================================{}", C_BOLD, C_RESET);
         println!(" 当前活动账号: {}{}{}  |  默认模型: {}{}{}  |  套餐: {}{}{}", C_WHITE, email, C_RESET, C_CYAN, cur_model, C_RESET, C_YELLOW, tier, C_RESET);
         println!(" 系统本地时间: {}{}{}", C_DIM, Local::now().format("%Y-%m-%d %H:%M:%S"), C_RESET);
-        println!("{}", "-".repeat(70));
-        println!(" {}[1]{} 查看当前账号额度详情 (Detailed Quota)", C_CYAN, C_RESET);
-        println!(" {}[2]{} 查看所有账号全局大盘 (All Accounts Overview)", C_CYAN, C_RESET);
-        println!(" {}[3]{} 切换当前活动账号 (Switch Account - 交互选择 / 序号 / 邮箱)", C_CYAN, C_RESET);
-        println!(" {}[4]{} 智能切至当前模型最高额度账号 (Auto-Switch Account in Model Quota Pool)", C_CYAN, C_RESET);
-        println!(" {}[A]{} 后台自动调配守护服务 (Auto-Guard Daemon - 监控/自动切号/通知)", C_GREEN, C_RESET);
-        println!(" {}[P]{} 一键唤醒全账号池沉睡周额度时钟 (Pre-warm Weekly Clocks - 提前激活7天倒计时)", C_MAGENTA, C_RESET);
-        println!(" {}[M]{} 切换全局默认模型 (Switch Default Model: Claude Opus/Sonnet / Gemini)", C_BLUE, C_RESET);
-        println!(" {}[5]{} 保存当前 agy 账号至账号池 (Save Active agy Account)", C_CYAN, C_RESET);
-        println!(" {}[6]{} 添加新账号到账号池 (Add New Account - 浏览器授权 / Token)", C_CYAN, C_RESET);
-        println!(" {}[7]{} 从账号池移除账号 (Remove Account)", C_CYAN, C_RESET);
-        println!(" {}[8]{} 强制刷新当前账号凭据 (Refresh Token)", C_CYAN, C_RESET);
-        println!(" {}[9]{} 自动重启所有运行中的 agy 终端会话 (Reload All Sessions)", C_CYAN, C_RESET);
+        println!("{}", "=".repeat(70));
+
+        // 自动拉取并展示全账号额度大盘
+        println!("{}[*] 正在刷新全账号配额...{}", C_DIM, C_RESET);
+        let _ = io::stdout().flush();
+        let (rows, current_id, best_acc) = fetch_all_accounts_data();
+        print!("\x1B[1A\x1B[2K");
+        let _ = io::stdout().flush();
+        print_accounts_table(&rows, current_id.as_deref(), best_acc.as_ref());
+
+        println!("{}", "=".repeat(70));
+        println!(" {}[1]{} 智能切至最高额度账号 (Auto-Switch in Model Quota Pool)", C_GREEN, C_RESET);
+        println!(" {}[2]{} 手动切换账号 (Switch Account - 交互选择 / 序号 / 邮箱)", C_CYAN, C_RESET);
+        println!(" {}[3]{} 切换全局默认模型 (Switch Model: Claude Opus/Sonnet / Gemini)", C_BLUE, C_RESET);
+        println!(" {}[4]{} 守护服务管理 (Auto-Guard: 监控/自动切号/重启会话/日志)", C_GREEN, C_RESET);
+        println!(" {}[P]{} 一键唤醒全账号池沉睡周额度时钟 (Pre-warm Weekly Clocks)", C_MAGENTA, C_RESET);
+        println!(" {}[5]{} 账号管理 (保存 / 添加 / 移除 / 刷新凭据)", C_CYAN, C_RESET);
         println!(" {}[0]{} 退出程序 (Exit)", C_RED, C_RESET);
         println!("{}======================================================================{}", C_BOLD, C_RESET);
 
-        print!(">> 请输入选项 {}[0-9/A/P/M]{}: ", C_BOLD, C_RESET);
+        print!(">> 请输入选项 {}[0-5/P]{}: ", C_BOLD, C_RESET);
         let _ = io::stdout().flush();
         let mut choice = String::new();
         if io::stdin().read_line(&mut choice).is_err() {
@@ -3188,21 +3232,15 @@ fn run_cli_menu() {
         }
 
         match choice.trim() {
-            "1" => option_view_current_quota(),
-            "2" => option_view_all_accounts(),
-            "3" => option_switch_account(),
-            "4" => option_auto_switch(),
-            "a" | "A" => option_guard_management(),
+            "1" => option_auto_switch(),
+            "2" => option_switch_account(),
+            "3" => option_switch_model(),
+            "4" => option_guard_management(),
             "p" | "P" => {
                 prewarm_all_dormant_clocks(false);
                 pause();
             }
-            "m" | "M" => option_switch_model(),
-            "5" => option_save_current_account(),
-            "6" => option_add_account(),
-            "7" => option_remove_account(),
-            "8" => option_force_refresh(),
-            "9" => option_reload_all_sessions(),
+            "5" => option_account_management(),
             "0" | "q" | "quit" | "exit" => {
                 println!("\n{}[+] 感谢使用 Antigravity 配额中心，再见！{}\n", C_GREEN, C_RESET);
                 break;
